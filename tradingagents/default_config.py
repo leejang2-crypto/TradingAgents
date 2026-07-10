@@ -19,6 +19,7 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_BENCHMARK_TICKER":     "benchmark_ticker",
     "TRADINGAGENTS_TEMPERATURE":          "temperature",
     "TRADINGAGENTS_LLM_MAX_RETRIES":      "llm_max_retries",
+    "TRADINGAGENTS_NEWS_DATA_VENDOR":     "news_data_vendor",
     # Provider-specific reasoning/thinking knobs (None = each provider's own
     # default). Settable here for non-interactive runs; the CLI also offers an
     # interactive choice, which is skipped when the matching var is set.
@@ -62,7 +63,10 @@ def _apply_env_overrides(config: dict) -> dict:
         if raw is None or raw == "":
             continue
         try:
-            config[key] = _coerce(raw, config.get(key))
+            if key == "news_data_vendor":
+                config["data_vendors"]["news_data"] = raw
+            else:
+                config[key] = _coerce(raw, config.get(key))
         except ValueError as exc:
             raise ValueError(f"Invalid value for {env_var}: {exc}") from exc
     return config
@@ -124,6 +128,16 @@ DEFAULT_CONFIG = _apply_env_overrides({
         "geopolitical risk trade war sanctions",
         "ECB Bank of England BOJ central bank policy",
         "oil commodities supply chain energy",
+    ],
+    # Naver Search API configuration for Korean-market news. Requires
+    # NAVER_CLIENT_ID and NAVER_CLIENT_SECRET when selected as a news vendor.
+    "naver_news_display": 10,
+    "naver_news_sort": "date",
+    "naver_news_query_map": {},
+    "naver_global_news_queries": [
+        "코스피 환율 금리 증시",
+        "한국은행 금리 물가 경기",
+        "미국 연준 금리 나스닥 반도체",
     ],
     # Data vendor configuration
     # Category-level configuration (default for all tools in category).
