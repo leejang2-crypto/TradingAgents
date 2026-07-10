@@ -27,6 +27,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_verified_market_snapshot,
     resolve_instrument_identity,
 )
+from tradingagents.agents.utils.local_safe import hold_decision, validate_trading_state
 from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.utils import safe_ticker_component
@@ -91,28 +92,7 @@ class TradingAgentsGraph:
         os.makedirs(self.config["data_cache_dir"], exist_ok=True)
         os.makedirs(self.config["results_dir"], exist_ok=True)
 
-        # Initialize LLMs with provider-specific thinking configuration
-        llm_kwargs = self._get_provider_kwargs()
-
-        # Add callbacks to kwargs if provided (passed to LLM constructor)
-        if self.callbacks:
-            llm_kwargs["callbacks"] = self.callbacks
-
-        deep_client = create_llm_client(
-            provider=self.config["llm_provider"],
-            model=self.config["deep_think_llm"],
-            base_url=self.config.get("backend_url"),
-            **llm_kwargs,
-        )
-        quick_client = create_llm_client(
-            provider=self.config["llm_provider"],
-            model=self.config["quick_think_llm"],
-            base_url=self.config.get("backend_url"),
-            **llm_kwargs,
-        )
-
-        self.deep_thinking_llm = deep_client.get_llm()
-        self.quick_thinking_llm = quick_client.get_llm()
+        self.agent_llms = self._create_llms()
 
         self.memory_log = TradingMemoryLog(self.config)
 
@@ -129,6 +109,7 @@ class TradingAgentsGraph:
             self.deep_thinking_llm,
             self.tool_nodes,
             self.conditional_logic,
+            agent_llms=self.agent_llms,
         )
 
         self.propagator = Propagator(
@@ -152,8 +133,12 @@ class TradingAgentsGraph:
 
     def _get_provider_kwargs(self) -> dict[str, Any]:
         """Get provider-specific kwargs for LLM client creation."""
+        return self._get_provider_kwargs_for(self.config.get("llm_provider", ""))
+
+    def _get_provider_kwargs_for(self, provider: str) -> dict[str, Any]:
+        """Get provider-specific kwargs for one concrete LLM provider."""
         kwargs = {}
-        provider = self.config.get("llm_provider", "").lower()
+        provider = provider.lower()
 
         if provider == "google":
             thinking_level = self.config.get("google_thinking_level")
@@ -184,6 +169,97 @@ class TradingAgentsGraph:
             kwargs["max_retries"] = _coerce_max_retries(max_retries)
 
         return kwargs
+
+    def _create_llm(
+        self,
+        *,
+        provider: str,
+        model: str,
+        base_url: str | None = None,
+    ):
+        llm_kwargs = self._get_provider_kwargs_for(provider)
+        if self.callbacks:
+            llm_kwargs["callbacks"] = self.callbacks
+        client = create_llm_client(
+            provider=provider,
+            model=model,
+            base_url=base_url,
+            **llm_kwargs,
+        )
+        return client.get_llm()
+
+    def _create_llms(self) -> dict[str, Any]:
+        provider = self.config.get("llm_provider", "openai").lower()
+
+        if provider != "hybrid":
+            self.deep_thinking_llm = self._create_llm(
+                provider=provider,
+                model=self.config["deep_think_llm"],
+                base_url=self.config.get("backend_url"),
+            )
+            self.quick_thinking_llm = self._create_llm(
+                provider=provider,
+                model=self.config["quick_think_llm"],
+                base_url=self.config.get("backend_url"),
+            )
+            return {}
+
+        openai_quick = self._create_llm(
+            provider="openai",
+            model=self.config.get("hybrid_openai_quick_llm", self.config["quick_think_llm"]),
+            base_url=None,
+        )
+        openai_deep = self._create_llm(
+            provider="openai",
+            model=self.config.get("hybrid_openai_deep_llm", self.config["deep_think_llm"]),
+            base_url=None,
+        )
+        ollama_quick = self._create_llm(
+            provider="ollama",
+            model=self.config.get("hybrid_ollama_quick_llm", "qwen3:8b"),
+            base_url=self.config.get("ollama_backend_url") or "http://localhost:11434/v1",
+        )
+        ollama_deep = self._create_llm(
+            provider="ollama",
+            model=self.config.get("hybrid_ollama_deep_llm", "qwen3:8b"),
+            base_url=self.config.get("ollama_backend_url") or "http://localhost:11434/v1",
+        )
+
+        # Backwards-compatible defaults for helper components that still receive
+        # quick/deep LLMs directly.
+        self.quick_thinking_llm = openai_quick
+        self.deep_thinking_llm = openai_deep
+
+        pools = {
+            "openai": {"quick": openai_quick, "deep": openai_deep},
+            "ollama": {"quick": ollama_quick, "deep": ollama_deep},
+        }
+        deep_agents = {"research_manager", "portfolio_manager"}
+        agent_providers = self.config.get("hybrid_agent_providers", {})
+        agent_names = (
+            "market_analyst",
+            "sentiment_analyst",
+            "news_analyst",
+            "fundamentals_analyst",
+            "bull_researcher",
+            "bear_researcher",
+            "research_manager",
+            "trader",
+            "risk_aggressive",
+            "risk_neutral",
+            "risk_conservative",
+            "portfolio_manager",
+        )
+        routed = {}
+        for agent_name in agent_names:
+            agent_provider = str(agent_providers.get(agent_name, "openai")).lower()
+            if agent_provider not in pools:
+                raise ValueError(
+                    f"Unsupported hybrid provider for {agent_name}: {agent_provider!r}"
+                )
+            model_kind = "deep" if agent_name in deep_agents else "quick"
+            routed[agent_name] = pools[agent_provider][model_kind]
+        return routed
 
     def _create_tool_nodes(self) -> dict[str, ToolNode]:
         """Create tool nodes for different data sources using abstract methods."""
@@ -460,6 +536,7 @@ class TradingAgentsGraph:
             final_state = self.graph.invoke(init_agent_state, **args)
 
         # Store current state for reflection.
+        self._apply_local_safe_validation(final_state, company_name)
         self.curr_state = final_state
 
         # Log state to disk.
@@ -480,6 +557,32 @@ class TradingAgentsGraph:
             )
 
         return final_state, self.process_signal(final_state["final_trade_decision"])
+
+    def _apply_local_safe_validation(self, final_state: dict, ticker: str) -> None:
+        provider = self.config.get("llm_provider", "").lower()
+        if provider not in {"hybrid", "ollama"}:
+            return
+        if not self.config.get("local_safe_validation", True):
+            return
+
+        validation = validate_trading_state(final_state, ticker)
+        final_state["local_safe_validation"] = {
+            "ok": validation.ok,
+            "reasons": list(validation.reasons),
+        }
+        if validation.ok:
+            return
+
+        logger.warning(
+            "Local-safe validation failed for %s; forcing HOLD: %s",
+            ticker,
+            "; ".join(validation.reasons),
+        )
+        decision = hold_decision(validation.reasons)
+        final_state["final_trade_decision"] = decision
+        risk_state = final_state.get("risk_debate_state")
+        if isinstance(risk_state, dict):
+            risk_state["judge_decision"] = decision
 
     def _log_state(self, trade_date, final_state):
         """Log the final state to a JSON file."""

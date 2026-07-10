@@ -8,7 +8,7 @@ Reddit/X/StockTwits content under prompt pressure (verified live).
 The redesigned agent pre-fetches three complementary data sources before
 the LLM is invoked and injects them into the prompt as structured blocks:
 
-  1. News headlines     — Yahoo Finance (institutional framing)
+  1. News headlines     — configured news source, including Naver for Korea
   2. StockTwits messages — retail-trader posts indexed by cashtag, with
                            user-labeled Bullish/Bearish sentiment tags
   3. Reddit posts        — r/wallstreetbets, r/stocks, r/investing
@@ -132,7 +132,7 @@ def _build_system_message(
 
 ## Data sources (pre-fetched, in this prompt)
 
-### News headlines — Yahoo Finance, past 7 days
+### News headlines — configured news source, past 7 days
 Institutional framing. Fact-driven, slower-moving signal.
 
 <start_of_news>

@@ -57,10 +57,10 @@ OPENAI_API_KEY=...
 현재 smoke/dry-run 검증에서 사용한 모델:
 
 ```bash
-gpt-4.1-mini
+gpt-5.5
 ```
 
-참고: 현재 프로젝트의 모델 카탈로그에는 `gpt-4.1-mini`가 정식 목록으로 등록되어 있지 않아 warning이 출력되지만, 클라이언트는 unknown model을 허용하고 계속 실행합니다.
+참고: `gpt-5.5`는 현재 OpenAI 기본 실행 모델로 사용하도록 `main.py`, 실행 스크립트, 모델 카탈로그에 등록되어 있어 known model warning 없이 실행됩니다. `gpt-5.6-luna`는 공식 문서에는 표시되지만 현재 계정에서는 limited preview로 API 호출이 거부되어 기본값에서 제외했습니다.
 
 ### Yahoo Finance / yfinance
 
@@ -79,6 +79,7 @@ gpt-4.1-mini
 
 - 한국 종목 뉴스
 - 한국/글로벌 매크로 뉴스 보강
+- 한국 종목 실행 전 `.local/news/analysis_naver_<ticker>_<date>.json` 스냅샷을 수집하고 agent 도구 호출 시 해당 스냅샷을 우선 사용
 
 필수 환경변수:
 
@@ -221,8 +222,8 @@ TradingAgents/
 
 ```bash
 TRADINGAGENTS_LLM_PROVIDER=openai
-TRADINGAGENTS_DEEP_THINK_LLM=gpt-4.1-mini
-TRADINGAGENTS_QUICK_THINK_LLM=gpt-4.1-mini
+TRADINGAGENTS_DEEP_THINK_LLM=gpt-5.5
+TRADINGAGENTS_QUICK_THINK_LLM=gpt-5.5
 TRADINGAGENTS_OUTPUT_LANGUAGE=Korean
 TRADINGAGENTS_NEWS_DATA_VENDOR=naver,yfinance
 ```
@@ -637,7 +638,7 @@ cd /Users/leejang2/Project/TradingAgents
 ../.venv/bin/python scripts/run_minimal_analysis.py \
   --ticker AAPL \
   --date 2024-05-10 \
-  --model gpt-4.1-mini \
+  --model gpt-5.5 \
   --language Korean
 ```
 
@@ -665,7 +666,7 @@ cd /Users/leejang2/Project/TradingAgents
   --provider openai \
   --ticker 005930.KS \
   --date 2026-07-08 \
-  --model gpt-4.1-mini \
+  --model gpt-5.5 \
   --max-order-amount 100000
 ```
 
@@ -687,12 +688,13 @@ cd /Users/leejang2/Project/TradingAgents
 기능:
 
 1. `005930.KS` 분석
-2. market analyst + news analyst 실행
-3. news vendor는 `naver,yfinance`
-4. Research/Trader/Risk/Portfolio graph 실행
-5. 리포트 저장
-6. 최종 rating을 TossOrderPlan으로 변환
-7. 기본 dry-run으로 주문 payload가 있으면 사용자 승인 없이 paper trade 기록
+2. Naver Search API로 최근 뉴스 스냅샷 JSON 자동 수집
+3. market analyst + news analyst 실행
+4. news vendor는 `naver,yfinance`, Naver는 수집 스냅샷을 우선 사용
+5. Research/Trader/Risk/Portfolio graph 실행
+6. 리포트 저장
+7. 최종 rating을 TossOrderPlan으로 변환
+8. 기본 dry-run으로 주문 payload가 있으면 사용자 승인 없이 paper trade 기록
 
 실제 주문:
 
@@ -701,7 +703,7 @@ cd /Users/leejang2/Project/TradingAgents
   --provider openai \
   --ticker 005930.KS \
   --date 2026-07-08 \
-  --model gpt-4.1-mini \
+  --model gpt-5.5 \
   --max-order-amount 100000 \
   --execute
 ```
@@ -714,7 +716,7 @@ cd /Users/leejang2/Project/TradingAgents
 
 ```text
 OpenAI API 테스트 성공
-model: gpt-4.1-mini-2025-04-14
+model: gpt-5.5
 response: OK
 ```
 
@@ -733,7 +735,7 @@ Smoke PASSED: structured output -> rendered markdown chain works for openai
 ```text
 ticker: AAPL
 date: 2024-05-10
-model: gpt-4.1-mini
+model: gpt-5.5
 ```
 
 결과:
@@ -755,7 +757,7 @@ decision: Overweight
 ```text
 ticker: 005930.KS
 date: 2026-07-08
-model: gpt-4.1-mini
+model: gpt-5.5
 max_order_amount: 100000
 ```
 
@@ -841,9 +843,9 @@ Naver Search API는 검색 API입니다. 완전한 뉴스 DB나 정교한 sentim
 
 `Underweight`, `Sell`의 경우 현재는 보유 수량 조회 기반 전량 매도가 아니라 기본 최소 수량 plan입니다. 실제 운용에는 holdings 조회와 보유 수량 기반 매도 로직을 추가하는 것이 좋습니다.
 
-### 모델 카탈로그 warning
+### OpenAI 모델 카탈로그
 
-`gpt-4.1-mini`는 현재 로컬 model catalog에는 없으므로 warning이 출력됩니다. 실행은 가능하지만, 장기적으로는 `model_catalog.py`에 자주 쓰는 모델을 명시 등록하는 것이 좋습니다.
+OpenAI 기본 실행 모델은 `gpt-5.5`입니다. 이 모델은 `model_catalog.py`의 OpenAI quick/deep 옵션에 등록되어 있어 known model warning 없이 실행됩니다.
 
 ## 19. 향후 개선 제안
 
@@ -852,5 +854,5 @@ Naver Search API는 검색 API입니다. 완전한 뉴스 DB나 정교한 sentim
 3. Naver query map을 별도 JSON/YAML로 분리해 관심종목별 검색어 관리
 4. 한국 종목 benchmark를 `^KS11` 또는 `^KQ11`로 자동 매핑
 5. FRED 키가 없을 때 한국 매크로 뉴스/Naver global news 중심으로 macro prompt 최적화
-6. `gpt-4.1-mini`를 OpenAI model catalog에 등록해 warning 제거
+6. OpenAI 모델 카탈로그를 공식 지원 모델 변경에 맞춰 주기적으로 갱신
 7. 실주문 전 pre-trade risk check: 1일 주문횟수, 최대금액, 장 시간, 보유 포지션, 손절/익절 조건

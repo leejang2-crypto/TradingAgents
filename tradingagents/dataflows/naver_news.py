@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import html
+import json
 import os
 import re
 from datetime import datetime
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -116,8 +118,134 @@ def _format_articles(
     return "\n".join(lines)
 
 
+def _parse_collected_date(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
+def _load_collected_articles(path_value: str | None) -> list[dict[str, Any]]:
+    if not path_value:
+        return []
+    path = Path(path_value).expanduser()
+    if not path.exists() or path.suffix.lower() != ".json":
+        return []
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, dict):
+        articles = payload.get("articles", [])
+        return articles if isinstance(articles, list) else []
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
+def _collected_articles_for(
+    ticker: str,
+    start_date: str,
+    end_date: str,
+    *,
+    path_value: str | None,
+) -> list[dict[str, Any]]:
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    base = _base_symbol(ticker)
+    rows: list[dict[str, Any]] = []
+    for article in _load_collected_articles(path_value):
+        article_ticker = str(article.get("ticker", ""))
+        if _base_symbol(article_ticker) != base:
+            continue
+        pub_dt = _parse_collected_date(article.get("published_at"))
+        if pub_dt is not None and not (start_dt <= pub_dt <= end_dt + relativedelta(days=1)):
+            continue
+        rows.append(article)
+    return rows
+
+
+def _format_collected_articles(
+    title: str,
+    articles: list[dict[str, Any]],
+) -> str:
+    if not articles:
+        return ""
+    lines = [f"## {title}", "", "Source mode: pre-collected Naver Search API snapshot.", ""]
+    for raw in articles:
+        article_title = str(raw.get("title", "No title")).strip()
+        description = str(raw.get("description", "")).strip()
+        link = str(raw.get("link", "")).strip()
+        source_date = raw.get("published_at") or "unknown date"
+        query = raw.get("query")
+        query_suffix = f", query: {query}" if query else ""
+        lines.append(f"### {article_title} (source: Naver, {source_date}{query_suffix})")
+        if description:
+            lines.append(description)
+        if link:
+            lines.append(f"Link: {link}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def collect_news_naver(
+    ticker: str,
+    start_date: str,
+    end_date: str,
+    *,
+    display: int | None = None,
+    sort: str | None = None,
+) -> list[dict[str, Any]]:
+    """Collect structured Naver news articles for a Korean stock ticker.
+
+    The result is intended for local export and downstream processing. It keeps
+    the same query mapping and date-window filtering used by the TradingAgents
+    news analyst path.
+    """
+    config = get_config()
+    resolved_display = int(
+        display if display is not None else config.get("naver_news_display", config.get("news_article_limit", 10))
+    )
+    resolved_sort = sort or config.get("naver_news_sort", "date")
+    query = _query_for_symbol(ticker)
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    rows: list[dict[str, Any]] = []
+    for raw in _search(query, display=resolved_display, sort=resolved_sort):
+        pub_dt = _parse_pub_date(raw.get("pubDate"))
+        if pub_dt is not None and not (start_dt <= pub_dt <= end_dt + relativedelta(days=1)):
+            continue
+        rows.append(
+            {
+                "ticker": ticker,
+                "query": query,
+                "title": _strip_html(str(raw.get("title", "No title"))),
+                "description": _strip_html(str(raw.get("description", ""))),
+                "link": raw.get("originallink") or raw.get("link") or "",
+                "naver_link": raw.get("link") or "",
+                "published_at": pub_dt.isoformat(timespec="minutes") if pub_dt else None,
+                "source": "Naver Search API",
+            }
+        )
+    return rows
+
+
 def get_news_naver(ticker: str, start_date: str, end_date: str) -> str:
     config = get_config()
+    if config.get("naver_news_use_collected", True):
+        collected = _collected_articles_for(
+            ticker,
+            start_date,
+            end_date,
+            path_value=config.get("naver_news_collected_data_path"),
+        )
+        if collected:
+            return _format_collected_articles(
+                f"Naver News for {ticker}, from {start_date} to {end_date}:",
+                collected,
+            )
+        if config.get("naver_news_collected_data_path") and not config.get("naver_news_live_fallback", True):
+            return f"No collected Naver news found for {ticker} between {start_date} and {end_date}."
+
     display = int(config.get("naver_news_display", config.get("news_article_limit", 10)))
     sort = config.get("naver_news_sort", "date")
     query = _query_for_symbol(ticker)

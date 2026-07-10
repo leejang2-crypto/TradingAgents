@@ -12,6 +12,7 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_DEEP_THINK_LLM":       "deep_think_llm",
     "TRADINGAGENTS_QUICK_THINK_LLM":      "quick_think_llm",
     "TRADINGAGENTS_LLM_BACKEND_URL":      "backend_url",
+    "TRADINGAGENTS_OLLAMA_BACKEND_URL":   "ollama_backend_url",
     "TRADINGAGENTS_OUTPUT_LANGUAGE":      "output_language",
     "TRADINGAGENTS_MAX_DEBATE_ROUNDS":    "max_debate_rounds",
     "TRADINGAGENTS_MAX_RISK_ROUNDS":      "max_risk_discuss_rounds",
@@ -85,12 +86,35 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "llm_provider": "openai",
     "deep_think_llm": "gpt-5.5",
     "quick_think_llm": "gpt-5.4-mini",
+    # Hybrid mode uses local Ollama for draft/low-risk agents and OpenAI for
+    # decision-critical agents. This reduces OpenAI tokens while keeping final
+    # trade/risk decisions on the more reliable structured-output path.
+    "hybrid_openai_quick_llm": "gpt-5.5",
+    "hybrid_openai_deep_llm": "gpt-5.5",
+    "hybrid_ollama_quick_llm": "qwen3:8b",
+    "hybrid_ollama_deep_llm": "qwen3:8b",
+    "hybrid_agent_providers": {
+        "market_analyst": "ollama",
+        "sentiment_analyst": "ollama",
+        "news_analyst": "ollama",
+        "fundamentals_analyst": "ollama",
+        "bull_researcher": "ollama",
+        "bear_researcher": "ollama",
+        "research_manager": "openai",
+        "trader": "openai",
+        "risk_aggressive": "ollama",
+        "risk_neutral": "ollama",
+        "risk_conservative": "openai",
+        "portfolio_manager": "openai",
+    },
+    "local_safe_validation": True,
     # When None, each provider's client falls back to its own default endpoint
     # (api.openai.com for OpenAI, generativelanguage.googleapis.com for Gemini, ...).
     # The CLI overrides this per provider when the user picks one. Keeping a
     # provider-specific URL here would leak (e.g. OpenAI's /v1 was previously
     # being forwarded to Gemini, producing malformed request URLs).
     "backend_url": None,
+    "ollama_backend_url": "http://localhost:11434/v1",
     # Provider-specific thinking configuration
     "google_thinking_level": None,      # "high", "minimal", etc.
     "openai_reasoning_effort": None,    # "medium", "high", "low"
@@ -134,6 +158,12 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "naver_news_display": 10,
     "naver_news_sort": "date",
     "naver_news_query_map": {},
+    # When set, Naver news tools first read structured articles collected by
+    # scripts/collect_naver_news.py or the Korea analysis runner. This lets all
+    # downstream agents use the same frozen news snapshot during one analysis.
+    "naver_news_collected_data_path": "",
+    "naver_news_use_collected": True,
+    "naver_news_live_fallback": True,
     "naver_global_news_queries": [
         "코스피 환율 금리 증시",
         "한국은행 금리 물가 경기",

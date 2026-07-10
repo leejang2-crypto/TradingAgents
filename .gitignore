@@ -222,3 +222,4 @@ __marimo__/
 .env.enterprise
 reports/
 .local/
+.DS_Store
