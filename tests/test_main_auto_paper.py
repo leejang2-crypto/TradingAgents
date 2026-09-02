@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import subprocess
 from datetime import datetime
 from decimal import Decimal
 
@@ -96,3 +97,72 @@ def test_next_regular_market_open_skips_configured_holidays():
     next_open = main.next_regular_market_open(friday_after_close, holidays=holidays)
 
     assert next_open.isoformat() == "2026-09-08T09:00:00+09:00"
+
+
+def test_monitor_snapshot_degrades_without_artifacts(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "LOCAL_DIR", tmp_path)
+
+    snapshot = main.build_monitor_snapshot()
+
+    assert snapshot["timezone"] == "Asia/Seoul"
+    assert snapshot["latestSummaryPath"] is None
+    assert snapshot["recentTrades"] == []
+
+
+def test_monitor_status_file_round_trips(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "LOCAL_DIR", tmp_path)
+
+    main.write_monitor_status("waiting", nextRunAfter="2026-09-04T09:00:00+09:00")
+    snapshot = main.build_monitor_snapshot()
+
+    assert snapshot["runtime"]["status"] == "waiting"
+    assert snapshot["runtime"]["nextRunAfter"] == "2026-09-04T09:00:00+09:00"
+
+
+def test_resolve_monitor_host_accepts_literal_host():
+    assert main.resolve_monitor_host("127.0.0.1") == ("127.0.0.1", "127.0.0.1")
+
+
+def test_resolve_monitor_host_uses_tailscale_ip(monkeypatch):
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, stdout="100.88.77.66\n", stderr="")
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    assert main.resolve_monitor_host("tailscale") == ("100.88.77.66", "100.88.77.66")
+
+
+def test_resolve_monitor_host_falls_back_to_ifconfig(monkeypatch):
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args[0])
+        if args[0] == "tailscale":
+            raise FileNotFoundError
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            stdout="utun4: flags=8051\n\tinet 100.101.102.103 netmask 0xffffffff\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    assert main.resolve_monitor_host("tailscale") == ("100.101.102.103", "100.101.102.103")
+    assert calls == ["tailscale", "ifconfig"]
+
+
+def test_resolve_monitor_host_errors_when_tailscale_ip_missing(monkeypatch):
+    def fake_run(args, **kwargs):
+        if args[0] == "tailscale":
+            raise FileNotFoundError
+        return subprocess.CompletedProcess(args, 0, stdout="lo0: inet 127.0.0.1\n", stderr="")
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    try:
+        main.resolve_monitor_host("tailscale")
+    except RuntimeError as exc:
+        assert "Could not resolve a Tailscale IPv4 address" in str(exc)
+    else:
+        raise AssertionError("Expected RuntimeError")

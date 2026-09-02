@@ -287,6 +287,67 @@ For a one-off immediate test run that exits after completion, use:
 /Users/leejang2/Project/.venv/bin/python main.py --run-mode once
 ```
 
+## Web Monitoring
+
+Start the read-only web monitor with the daily scheduler:
+
+```bash
+cd /Users/leejang2/Project/TradingAgents
+/Users/leejang2/Project/.venv/bin/python main.py \
+  --monitor \
+  --monitor-host 0.0.0.0 \
+  --monitor-port 8765
+```
+
+From the Mac mini itself, open:
+
+```text
+http://127.0.0.1:8765
+```
+
+From another device on the same network, open:
+
+```text
+http://<Mac-mini-LAN-IP>:8765
+```
+
+The monitor is read-only. It shows runtime status, the next scheduled run,
+the latest auto-paper summary, candidate ranking, and recent dry-run paper
+trades. The JSON API is also available:
+
+```text
+http://<Mac-mini-LAN-IP>:8765/api/status
+```
+
+### Tailscale Mobile-Data Access
+
+For access from a phone using mobile data, install Tailscale on both the Mac
+mini and the phone, then bind the monitor to the Mac's Tailscale IP:
+
+```bash
+cd /Users/leejang2/Project/TradingAgents
+/Users/leejang2/Project/.venv/bin/python main.py \
+  --monitor \
+  --monitor-host tailscale \
+  --monitor-port 8765
+```
+
+`main.py` resolves the Mac's Tailscale IPv4 address with:
+
+```bash
+tailscale ip -4
+```
+
+The startup log prints the exact URL, usually like:
+
+```text
+http://100.x.y.z:8765
+```
+
+Open that URL from the phone browser after logging in to the same Tailscale
+tailnet. This keeps the monitor off the public internet and avoids router port
+forwarding.
+
 This never sends a real Toss order. Real orders still require:
 
 ```bash

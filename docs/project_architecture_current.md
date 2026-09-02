@@ -16,6 +16,7 @@ TradingAgents는 여러 LLM agent가 금융 데이터를 수집하고 토론하�
 - 일 목표 수익률은 1%, 즉 일 목표 수익금 100,000원으로 설정
 - 종목당 기본 진입 예산은 자본금의 10%, 즉 1,000,000원으로 설정
 - `main.py` 기본 실행은 한국 정규장 09:00-15:30, 월-금 기준으로 매일 1회 모의투자를 수행
+- `main.py --monitor --monitor-host tailscale` 실행 시 Tailscale에 로그인된 외부 모바일 데이터 기기의 웹브라우저에서 모의투자 상태를 읽기 전용으로 확인
 - 최종 Portfolio Manager 판단을 Toss 주문 계획으로 변환
 - 기본은 `dry-run` 모의 체결 기록, 명시적으로 `--execute`를 줄 때만 Toss 실제 주문 전송
 

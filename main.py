@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
 import json
 import os
+import re
 import subprocess
 import sys
+import threading
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -31,6 +37,8 @@ DEFAULT_TRADING_STYLE = "intraday-scalping"
 KOREA_TZ = ZoneInfo("Asia/Seoul")
 DEFAULT_MARKET_OPEN = "09:00"
 DEFAULT_MARKET_CLOSE = "15:30"
+DEFAULT_MONITOR_HOST = "127.0.0.1"
+DEFAULT_MONITOR_PORT = 8765
 
 
 def make_parser() -> argparse.ArgumentParser:
@@ -143,6 +151,27 @@ def make_parser() -> argparse.ArgumentParser:
             "Comma-separated market holiday dates YYYY-MM-DD to skip. "
             "Can also be set via TRADINGAGENTS_MARKET_HOLIDAYS."
         ),
+    )
+    parser.add_argument(
+        "--monitor",
+        action="store_true",
+        default=os.environ.get("TRADINGAGENTS_MONITOR", "").strip().lower()
+        in {"1", "true", "yes", "on"},
+        help="Start a read-only web monitor for main.py status and paper-trading artifacts.",
+    )
+    parser.add_argument(
+        "--monitor-host",
+        default=os.environ.get("TRADINGAGENTS_MONITOR_HOST", DEFAULT_MONITOR_HOST),
+        help=(
+            "Web monitor bind host. Use 'tailscale' to bind to the Mac's "
+            "Tailscale IPv4 address, or 0.0.0.0 for LAN access."
+        ),
+    )
+    parser.add_argument(
+        "--monitor-port",
+        type=int,
+        default=int(os.environ.get("TRADINGAGENTS_MONITOR_PORT", DEFAULT_MONITOR_PORT)),
+        help="Web monitor port. Default: 8765.",
     )
     parser.add_argument(
         "--llm-timeout",
@@ -258,6 +287,10 @@ def scheduler_state_path() -> Path:
     return LOCAL_DIR / "scheduler" / "auto_paper_daily_runs.json"
 
 
+def monitor_status_path() -> Path:
+    return LOCAL_DIR / "monitor" / "main_status.json"
+
+
 def load_scheduler_state() -> dict[str, Any]:
     path = scheduler_state_path()
     if not path.exists():
@@ -284,6 +317,273 @@ def mark_scheduler_completed(run_date: str, summary_path: str | None) -> None:
 
 def has_scheduler_completed(run_date: str) -> bool:
     return run_date in set(load_scheduler_state().get("completedDates", []))
+
+
+def write_monitor_status(status: str, **extra: Any) -> None:
+    payload = {
+        "status": status,
+        "updatedAt": datetime.now(KOREA_TZ).isoformat(timespec="seconds"),
+        **extra,
+    }
+    path = monitor_status_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def read_json_file(path: Path) -> dict[str, Any] | list[Any] | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def latest_file(directory: Path, pattern: str) -> Path | None:
+    if not directory.exists():
+        return None
+    matches = sorted(directory.glob(pattern), key=lambda path: path.stat().st_mtime, reverse=True)
+    return matches[0] if matches else None
+
+
+def read_tail_jsonl(path: Path, limit: int = 20) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()[-limit:]
+    except OSError:
+        return []
+    records = []
+    for line in lines:
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return records
+
+
+def build_monitor_snapshot() -> dict[str, Any]:
+    latest_summary_path = latest_file(LOCAL_DIR / "auto_paper", "auto_paper_*.json")
+    latest_candidate_path = latest_file(LOCAL_DIR / "candidates", "auto_paper_candidates_*.json")
+    latest_summary = read_json_file(latest_summary_path) if latest_summary_path else None
+    latest_candidates = read_json_file(latest_candidate_path) if latest_candidate_path else None
+    trades = read_tail_jsonl(LOCAL_DIR / "paper_trades" / "trades.jsonl", limit=30)
+    return {
+        "now": datetime.now(KOREA_TZ).isoformat(timespec="seconds"),
+        "timezone": "Asia/Seoul",
+        "runtime": read_json_file(monitor_status_path()) or {},
+        "scheduler": read_json_file(scheduler_state_path()) or {"completedDates": []},
+        "latestSummaryPath": str(latest_summary_path) if latest_summary_path else None,
+        "latestSummary": latest_summary,
+        "latestCandidatePath": str(latest_candidate_path) if latest_candidate_path else None,
+        "latestCandidates": latest_candidates,
+        "recentTrades": trades,
+    }
+
+
+def _compact_text(value: Any, fallback: str = "-") -> str:
+    if value is None or value == "":
+        return fallback
+    return html.escape(str(value))
+
+
+def render_monitor_html(snapshot: dict[str, Any]) -> str:
+    runtime = snapshot.get("runtime") or {}
+    summary = snapshot.get("latestSummary") if isinstance(snapshot.get("latestSummary"), dict) else {}
+    candidates = snapshot.get("latestCandidates") if isinstance(snapshot.get("latestCandidates"), dict) else {}
+    candidate_rows = []
+    for row in (candidates.get("candidates") or [])[:10]:
+        candidate_rows.append(
+            "<tr>"
+            f"<td>{_compact_text(row.get('ticker'))}</td>"
+            f"<td>{_compact_text(row.get('name'))}</td>"
+            f"<td>{_compact_text(row.get('score'))}</td>"
+            f"<td>{_compact_text(row.get('mentionCount'))}</td>"
+            f"<td>{_compact_text(row.get('positiveSignalCount'))}</td>"
+            f"<td>{_compact_text(row.get('riskSignalCount'))}</td>"
+            "</tr>"
+        )
+    trade_rows = []
+    for trade in reversed(snapshot.get("recentTrades") or []):
+        plan = trade.get("plan") or {}
+        trade_rows.append(
+            "<tr>"
+            f"<td>{_compact_text(trade.get('recordedAt'))}</td>"
+            f"<td>{_compact_text(plan.get('symbol'))}</td>"
+            f"<td>{_compact_text(plan.get('action'))}</td>"
+            f"<td>{_compact_text(plan.get('order_amount') or plan.get('quantity'))}</td>"
+            f"<td>{_compact_text(plan.get('rating'))}</td>"
+            "</tr>"
+        )
+    analysis_rows = []
+    for analysis in (summary.get("analyses") or []):
+        toss = analysis.get("toss") or {}
+        plan = toss.get("plan") or {}
+        analysis_rows.append(
+            "<tr>"
+            f"<td>{_compact_text(analysis.get('ticker'))}</td>"
+            f"<td>{_compact_text(analysis.get('candidateRank'))}</td>"
+            f"<td>{_compact_text(analysis.get('decision'))}</td>"
+            f"<td>{_compact_text(plan.get('action'))}</td>"
+            f"<td>{_compact_text(analysis.get('reportPath'))}</td>"
+            "</tr>"
+        )
+    return f"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="30">
+  <title>TradingAgents Monitor</title>
+  <style>
+    :root {{ color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    body {{ margin: 0; background: #f7f8fa; color: #1d2433; }}
+    header {{ background: #12343b; color: white; padding: 22px clamp(16px, 4vw, 44px); }}
+    main {{ padding: 22px clamp(16px, 4vw, 44px); display: grid; gap: 18px; }}
+    section {{ background: white; border: 1px solid #d9dee7; border-radius: 8px; padding: 16px; overflow-x: auto; }}
+    h1 {{ margin: 0; font-size: 24px; }}
+    h2 {{ margin: 0 0 12px; font-size: 17px; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }}
+    .metric {{ border-left: 4px solid #2f7d6d; background: #f2fbf8; padding: 10px 12px; }}
+    .label {{ color: #5a667a; font-size: 12px; }}
+    .value {{ margin-top: 4px; font-size: 18px; font-weight: 700; word-break: break-word; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
+    th, td {{ border-bottom: 1px solid #e5e9f0; padding: 9px; text-align: left; vertical-align: top; }}
+    th {{ color: #4c5a70; background: #f7f8fa; }}
+    code {{ color: #40516d; word-break: break-all; }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>TradingAgents Monitor</h1>
+    <div>Asia/Seoul {_compact_text(snapshot.get("now"))} · 30초 자동 새로고침</div>
+  </header>
+  <main>
+    <section>
+      <h2>Runtime</h2>
+      <div class="grid">
+        <div class="metric"><div class="label">상태</div><div class="value">{_compact_text(runtime.get("status"))}</div></div>
+        <div class="metric"><div class="label">업데이트</div><div class="value">{_compact_text(runtime.get("updatedAt"))}</div></div>
+        <div class="metric"><div class="label">다음 실행</div><div class="value">{_compact_text(runtime.get("nextRunAfter"))}</div></div>
+        <div class="metric"><div class="label">오늘 실행일</div><div class="value">{_compact_text(runtime.get("date") or summary.get("date"))}</div></div>
+      </div>
+    </section>
+    <section>
+      <h2>Objective</h2>
+      <div class="grid">
+        <div class="metric"><div class="label">자본금</div><div class="value">{_compact_text(summary.get("paperCapital"))} KRW</div></div>
+        <div class="metric"><div class="label">일 목표 수익</div><div class="value">{_compact_text(summary.get("dailyTargetProfit"))} KRW</div></div>
+        <div class="metric"><div class="label">종목당 예산</div><div class="value">{_compact_text(summary.get("perTradeBudget"))} KRW</div></div>
+        <div class="metric"><div class="label">운영 모드</div><div class="value">{_compact_text(summary.get("runMode"))}</div></div>
+      </div>
+    </section>
+    <section>
+      <h2>Latest Analyses</h2>
+      <table><thead><tr><th>Ticker</th><th>Rank</th><th>Decision</th><th>Order</th><th>Report</th></tr></thead>
+      <tbody>{''.join(analysis_rows) or '<tr><td colspan="5">No analysis yet</td></tr>'}</tbody></table>
+      <p><code>{_compact_text(snapshot.get("latestSummaryPath"))}</code></p>
+    </section>
+    <section>
+      <h2>Candidate Ranking</h2>
+      <table><thead><tr><th>Ticker</th><th>Name</th><th>Score</th><th>Mentions</th><th>Positive</th><th>Risk</th></tr></thead>
+      <tbody>{''.join(candidate_rows) or '<tr><td colspan="6">No candidates yet</td></tr>'}</tbody></table>
+      <p><code>{_compact_text(snapshot.get("latestCandidatePath"))}</code></p>
+    </section>
+    <section>
+      <h2>Recent Paper Trades</h2>
+      <table><thead><tr><th>Time</th><th>Symbol</th><th>Action</th><th>Amount/Qty</th><th>Rating</th></tr></thead>
+      <tbody>{''.join(trade_rows) or '<tr><td colspan="5">No paper trades yet</td></tr>'}</tbody></table>
+    </section>
+  </main>
+</body>
+</html>
+"""
+
+
+class MonitorHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/status":
+            payload = json.dumps(build_monitor_snapshot(), ensure_ascii=False, indent=2).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if parsed.path in {"/", "/index.html"}:
+            payload = render_monitor_html(build_monitor_snapshot()).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        self.send_error(404)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+
+def start_monitor_server(host: str, port: int) -> ThreadingHTTPServer:
+    bind_host, access_host = resolve_monitor_host(host)
+    server = ThreadingHTTPServer((bind_host, port), MonitorHandler)
+    server.monitor_url = f"http://{access_host}:{port}"  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    write_monitor_status(
+        "monitor-started",
+        monitorUrl=f"http://{access_host}:{port}",
+        monitorBindHost=bind_host,
+        monitorHostMode=host,
+    )
+    return server
+
+
+def resolve_monitor_host(host: str) -> tuple[str, str]:
+    if host.strip().lower() != "tailscale":
+        return host, host
+    ip_address = find_tailscale_ipv4()
+    if not ip_address:
+        raise RuntimeError(
+            "Could not resolve a Tailscale IPv4 address. Open Tailscale, sign "
+            "in on this Mac, then run main.py with --monitor-host tailscale again."
+        )
+    return ip_address, ip_address
+
+
+def find_tailscale_ipv4() -> str | None:
+    try:
+        result = subprocess.run(
+            ["tailscale", "ip", "-4"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        result = None
+    if result and result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip().splitlines()[0]
+
+    try:
+        ifconfig = subprocess.run(
+            ["ifconfig"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return None
+    if ifconfig.returncode != 0:
+        return None
+    tailscale_network = ipaddress.ip_network("100.64.0.0/10")
+    for match in re.finditer(r"\binet\s+(\d+\.\d+\.\d+\.\d+)\b", ifconfig.stdout):
+        candidate = ipaddress.ip_address(match.group(1))
+        if candidate in tailscale_network:
+            return str(candidate)
+    return None
 
 
 def order_budget(args: argparse.Namespace) -> Decimal:
@@ -677,24 +977,19 @@ async def run_auto_paper(args: argparse.Namespace) -> dict[str, Any]:
 
 async def run_daily_market_scheduler(args: argparse.Namespace) -> int:
     holidays = holiday_dates(args.holiday_dates)
-    print(
-        json.dumps(
-            {
-                "scheduler": "daily-market",
-                "status": "started",
-                "timezone": "Asia/Seoul",
-                "marketOpen": args.market_open,
-                "marketClose": args.market_close,
-                "paperCapital": args.paper_capital,
-                "dailyTargetReturn": args.daily_target_return,
-                "dailyTargetProfit": str(daily_profit_target(args)),
-                "perTradeBudget": str(order_budget(args)),
-                "holidayDates": sorted(day.isoformat() for day in holidays),
-            },
-            ensure_ascii=False,
-        ),
-        flush=True,
-    )
+    startup_status = {
+        "scheduler": "daily-market",
+        "timezone": "Asia/Seoul",
+        "marketOpen": args.market_open,
+        "marketClose": args.market_close,
+        "paperCapital": args.paper_capital,
+        "dailyTargetReturn": args.daily_target_return,
+        "dailyTargetProfit": str(daily_profit_target(args)),
+        "perTradeBudget": str(order_budget(args)),
+        "holidayDates": sorted(day.isoformat() for day in holidays),
+    }
+    write_monitor_status("scheduler-started", **startup_status)
+    print(json.dumps({"status": "scheduler-started", **startup_status}, ensure_ascii=False), flush=True)
     while True:
         now = datetime.now(KOREA_TZ)
         run_date = now.date().isoformat()
@@ -712,35 +1007,31 @@ async def run_daily_market_scheduler(args: argparse.Namespace) -> int:
                     holidays=holidays,
                 )
                 wait_seconds = max(1, int((next_open - now).total_seconds()))
+                status_payload = {
+                    "scheduler": "daily-market",
+                    "date": run_date,
+                    "nextRunAfter": next_open.isoformat(timespec="seconds"),
+                }
+                write_monitor_status("already-completed", **status_payload)
                 print(
-                    json.dumps(
-                        {
-                            "scheduler": "daily-market",
-                            "status": "already-completed",
-                            "date": run_date,
-                            "nextRunAfter": next_open.isoformat(timespec="seconds"),
-                        },
-                        ensure_ascii=False,
-                    ),
+                    json.dumps({"status": "already-completed", **status_payload}, ensure_ascii=False),
                     flush=True,
                 )
                 await asyncio.sleep(min(wait_seconds, max(args.scheduler_poll_seconds, 1)))
                 continue
 
             args.date = run_date
-            print(
-                json.dumps(
-                    {
-                        "scheduler": "daily-market",
-                        "status": "running-auto-paper",
-                        "date": run_date,
-                    },
-                    ensure_ascii=False,
-                ),
-                flush=True,
-            )
+            status_payload = {"scheduler": "daily-market", "date": run_date}
+            write_monitor_status("running-auto-paper", **status_payload)
+            print(json.dumps({"status": "running-auto-paper", **status_payload}, ensure_ascii=False), flush=True)
             summary = await run_auto_paper(args)
             mark_scheduler_completed(run_date, summary.get("summaryPath"))
+            write_monitor_status(
+                "completed",
+                scheduler="daily-market",
+                date=run_date,
+                summaryPath=summary.get("summaryPath"),
+            )
             print(json.dumps({"results": [summary]}, ensure_ascii=False, indent=2), flush=True)
             continue
 
@@ -751,24 +1042,38 @@ async def run_daily_market_scheduler(args: argparse.Namespace) -> int:
             holidays=holidays,
         )
         wait_seconds = max(1, int((next_open - now).total_seconds()))
-        print(
-            json.dumps(
-                {
-                    "scheduler": "daily-market",
-                    "status": "waiting-for-market-open",
-                    "now": now.isoformat(timespec="seconds"),
-                    "nextRunAfter": next_open.isoformat(timespec="seconds"),
-                },
-                ensure_ascii=False,
-            ),
-            flush=True,
-        )
+        status_payload = {
+            "scheduler": "daily-market",
+            "now": now.isoformat(timespec="seconds"),
+            "nextRunAfter": next_open.isoformat(timespec="seconds"),
+        }
+        write_monitor_status("waiting-for-market-open", **status_payload)
+        print(json.dumps({"status": "waiting-for-market-open", **status_payload}, ensure_ascii=False), flush=True)
         await asyncio.sleep(min(wait_seconds, max(args.scheduler_poll_seconds, 1)))
 
 
 async def main_async() -> int:
     args = make_parser().parse_args()
     results: list[dict[str, Any]] = []
+    monitor_server = None
+    if args.monitor:
+        monitor_server = start_monitor_server(args.monitor_host, args.monitor_port)
+        monitor_url = getattr(monitor_server, "monitor_url", f"http://{args.monitor_host}:{args.monitor_port}")
+        print(
+            json.dumps(
+                {
+                    "monitor": "started",
+                    "url": monitor_url,
+                    "externalDeviceHint": (
+                        "Install and log in to Tailscale on your phone, then open this URL."
+                        if args.monitor_host.strip().lower() == "tailscale"
+                        else "Use http://<Mac-mini-LAN-IP>:%s when bound to 0.0.0.0." % args.monitor_port
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
 
     # Recommended OpenAI setup:
     #   Put OPENAI_API_KEY, NAVER_CLIENT_ID, NAVER_CLIENT_SECRET, and Toss keys
@@ -791,7 +1096,15 @@ async def main_async() -> int:
         if not args.date:
             args.date = today_korea().isoformat()
         results.append(await run_auto_paper(args))
+        write_monitor_status(
+            "completed",
+            scheduler="once",
+            date=args.date,
+            summaryPath=results[-1].get("summaryPath"),
+        )
         print(json.dumps({"results": results}, ensure_ascii=False, indent=2))
+        if monitor_server:
+            monitor_server.shutdown()
         return 0
 
     if not args.date:
