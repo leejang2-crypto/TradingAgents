@@ -10,6 +10,7 @@ from tradingagents.agents.schemas import TraderProposal, render_trader_proposal
 from tradingagents.agents.utils.agent_utils import (
     get_instrument_context_from_state,
     get_language_instruction,
+    get_trading_objective_instruction,
 )
 from tradingagents.agents.utils.structured import (
     bind_structured,
@@ -23,6 +24,7 @@ def create_trader(llm):
     def trader_node(state, name):
         company_name = state["company_of_interest"]
         instrument_context = get_instrument_context_from_state(state)
+        objective_instruction = get_trading_objective_instruction()
         investment_plan = state["investment_plan"]
 
         messages = [
@@ -31,7 +33,8 @@ def create_trader(llm):
                 "content": (
                     "You are a trading agent analyzing market data to make investment decisions. "
                     "Based on your analysis, provide a specific recommendation to buy, sell, or hold. "
-                    "Anchor your reasoning in the analysts' reports and the research plan."
+                    "Anchor your reasoning in the analysts' reports, the research plan, and the configured trading objective. "
+                    "For intraday paper trading, include practical entry, stop-loss, take-profit, and same-day exit guidance when possible."
                     + get_language_instruction()
                 ),
             },
@@ -43,6 +46,7 @@ def create_trader(llm):
                     f"insights from current technical market trends, macroeconomic indicators, and "
                     f"social media sentiment. Use this plan as a foundation for evaluating your next "
                     f"trading decision.\n\nProposed Investment Plan: {investment_plan}\n\n"
+                    f"{objective_instruction}\n\n"
                     f"Leverage these insights to make an informed and strategic decision."
                 ),
             },

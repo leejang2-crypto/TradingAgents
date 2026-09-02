@@ -33,6 +33,7 @@ from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.utils import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients import create_llm_client
+from tradingagents.llm_clients.timeout_wrapper import HardTimeoutLLM
 from tradingagents.reporting import write_report_tree
 
 from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
@@ -168,6 +169,10 @@ class TradingAgentsGraph:
         if max_retries is not None and max_retries != "":
             kwargs["max_retries"] = _coerce_max_retries(max_retries)
 
+        timeout = self.config.get("llm_timeout")
+        if timeout is not None and timeout != "":
+            kwargs["timeout"] = float(timeout)
+
         return kwargs
 
     def _create_llm(
@@ -186,7 +191,11 @@ class TradingAgentsGraph:
             base_url=base_url,
             **llm_kwargs,
         )
-        return client.get_llm()
+        llm = client.get_llm()
+        timeout = self.config.get("llm_timeout")
+        if timeout is not None and timeout != "":
+            return HardTimeoutLLM(llm, float(timeout))
+        return llm
 
     def _create_llms(self) -> dict[str, Any]:
         provider = self.config.get("llm_provider", "openai").lower()

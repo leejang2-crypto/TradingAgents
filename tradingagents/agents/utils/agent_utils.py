@@ -42,6 +42,7 @@ __all__ = [
     "build_instrument_context",
     "resolve_instrument_identity",
     "get_instrument_context_from_state",
+    "get_trading_objective_instruction",
     "get_language_instruction",
     "create_msg_delete",
 ]
@@ -63,6 +64,35 @@ def get_language_instruction() -> str:
     if lang.strip().lower() == "english":
         return ""
     return f" Write your entire response in {lang}."
+
+
+def get_trading_objective_instruction() -> str:
+    """Return the configured trading objective for decision-stage prompts."""
+    from tradingagents.dataflows.config import get_config
+
+    objective = get_config().get("trading_objective") or {}
+    if not isinstance(objective, Mapping):
+        return ""
+
+    style = objective.get("style")
+    capital = objective.get("capital_krw")
+    target_return = objective.get("daily_target_return")
+    target_profit = objective.get("daily_target_profit_krw")
+    per_trade_budget = objective.get("per_trade_budget_krw")
+    holding_period = objective.get("holding_period")
+    risk_note = objective.get("risk_note")
+    parts = [
+        "**Trading Objective:**",
+        f"- Style: {style or 'intraday'}",
+        f"- Paper capital: {capital or 'unknown'} KRW",
+        f"- Daily target return: {target_return or 'unknown'}",
+        f"- Daily target profit: {target_profit or 'unknown'} KRW",
+        f"- Default per-trade budget: {per_trade_budget or 'unknown'} KRW",
+        f"- Holding period: {holding_period or 'same-day preferred'}",
+    ]
+    if risk_note:
+        parts.append(f"- Risk discipline: {risk_note}")
+    return "\n".join(parts)
 
 
 def _clean_identity_value(value: Any) -> str | None:
@@ -212,6 +242,5 @@ def create_msg_delete():
         return {"messages": removal_operations + [placeholder]}
 
     return delete_messages
-
 
 

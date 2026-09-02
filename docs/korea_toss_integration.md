@@ -151,11 +151,13 @@ Comparison artifacts are saved under:
 .local/comparisons/
 ```
 
-## Hybrid OpenAI + Ollama Mode
+## Disabled Legacy Hybrid OpenAI + Ollama Mode
 
-Use hybrid mode to reduce OpenAI token usage while keeping final trading
-decisions on the more reliable OpenAI path. Ollama drafts lower-risk analysis;
-OpenAI handles decision-critical synthesis and portfolio output.
+Hybrid mode is currently disabled in `main.py` because local Ollama became the
+paper-trading bottleneck. Keep this section as rollback documentation only. To
+restore local LLM use, re-enable `--provider` choices in `main.py`, restore the
+commented `resolve_models()` hybrid/Ollama branch, and re-enable the commented
+hybrid config block.
 
 ```bash
 cd /Users/leejang2/Project/TradingAgents
@@ -188,3 +190,138 @@ Hybrid mode enables local-safe validation. If the local/hybrid chain contains
 mechanical failures such as ticker drift, an implausible stop loss, truncated
 portfolio output, or conflicting final action signals, the final decision is
 forced to `Hold` before Toss dry-run or execution planning.
+
+## Naver Candidate Discovery
+
+Use this runner before analyzing a specific ticker when you want news-driven
+candidate ideas. It queries Naver Search API with market/theme/signal/risk
+keywords, extracts known Korean ticker mentions, scores them, and writes both a
+machine-readable JSON file and a Markdown review report.
+
+```bash
+cd /Users/leejang2/Project/TradingAgents
+../.venv/bin/python scripts/discover_naver_candidates.py \
+  --end-date 2026-07-10 \
+  --days 3 \
+  --display 10 \
+  --limit 20
+```
+
+Optional custom queries:
+
+```bash
+../.venv/bin/python scripts/discover_naver_candidates.py \
+  --end-date 2026-07-10 \
+  --extra-queries "HBM4 고객 인증,전력망 투자 변압기,방산 수출 계약"
+```
+
+Default keyword buckets:
+
+- `market`: broad market, FX, rates, semiconductor index, investor flows
+- `themes`: HBM, power equipment, defense, shipbuilding, bio, batteries, value-up
+- `selection_signals`: earnings surprise, target-price upgrade, institutional/foreign buying, new orders, shareholder returns
+- `risk_signals`: earnings shock, dilution, trading halt, litigation, demand slowdown
+
+Outputs are saved under:
+
+```text
+.local/candidates/
+```
+
+Use the ranked candidates as the next `--korea-ticker` inputs for OpenAI
+analysis. The scoring is deliberately simple and transparent: positive
+signal mentions score higher, theme mentions add context, and risk mentions
+subtract from the score.
+
+## Automated Paper Trading
+
+`main.py` now defaults to `auto-paper` with `--run-mode daily-market`.
+Running only `main.py` keeps the process alive and performs the workflow once
+per Korean regular market session, Monday-Friday, between 09:00 and 15:30
+Asia/Seoul:
+
+1. Naver keyword-based candidate discovery
+2. Top candidate analysis with external OpenAI LLMs
+3. Toss dry-run paper trade recording when the final rating maps to BUY/SELL
+
+The current project objective is Korean-stock intraday paper trading with
+10,000,000 KRW capital and a daily target return of 1%. This means the daily
+paper profit target is 100,000 KRW. The default per-candidate BUY budget is
+10% of paper capital, so 1,000,000 KRW. Agents receive this objective in the
+Research Manager, Trader, and Portfolio Manager prompts so decisions prefer
+liquid same-day setups with explicit entry, stop-loss, take-profit, and exit
+discipline.
+
+```bash
+cd /Users/leejang2/Project/TradingAgents
+/Users/leejang2/Project/.venv/bin/python main.py
+```
+
+If the process starts before 09:00, after 15:30, or on a weekend, it waits for
+the next regular session. It records completed dates in:
+
+```text
+.local/scheduler/auto_paper_daily_runs.json
+```
+
+That file prevents accidental duplicate paper-trading runs when the process is
+left running or restarted on the same trading day.
+
+Equivalent explicit command:
+
+```bash
+/Users/leejang2/Project/.venv/bin/python main.py \
+  --scenario auto-paper \
+  --run-mode daily-market \
+  --provider openai \
+  --paper-capital 10000000 \
+  --position-pct 0.10 \
+  --daily-target-return 0.01 \
+  --trading-style intraday-scalping \
+  --trade-candidates 3
+```
+
+For a one-off immediate test run that exits after completion, use:
+
+```bash
+/Users/leejang2/Project/.venv/bin/python main.py --run-mode once
+```
+
+This never sends a real Toss order. Real orders still require:
+
+```bash
+--scenario korea-execute --yes
+```
+
+Auto-paper summary files are saved under:
+
+```text
+.local/auto_paper/
+```
+
+Dry-run order records are appended to:
+
+```text
+.local/paper_trades/trades.jsonl
+```
+
+Naver Search API calls are rate-limited before each request. The local quota
+ledger uses a file lock so multiple local TradingAgents processes share the
+same per-second and daily counters:
+
+```text
+.local/cache/naver_search_quota.json
+```
+
+Default limits are intentionally conservative:
+
+```text
+naver_rate_limit_per_second = 9
+naver_rate_limit_daily = 24000
+naver_rate_limit_retries = 2
+```
+
+This mirrors the Redis quota idea from the 429 troubleshooting article, but
+uses a local file-backed ledger for the current Mac-only setup. If this later
+runs across several machines, replace the file ledger with Redis `INCR`/expiry
+using the same quota concepts.

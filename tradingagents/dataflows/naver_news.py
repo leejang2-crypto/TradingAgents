@@ -6,10 +6,14 @@ import html
 import json
 import os
 import re
+import time
+from contextlib import contextmanager
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
+
+import fcntl
 
 import requests
 from dateutil.relativedelta import relativedelta
@@ -31,6 +35,90 @@ DEFAULT_KOREAN_QUERY_MAP = {
     "373220": "LG에너지솔루션",
     "105560": "KB금융",
     "055550": "신한지주",
+}
+
+DEFAULT_CANDIDATE_SYMBOL_MAP = {
+    **DEFAULT_KOREAN_QUERY_MAP,
+    "012330": "현대모비스",
+    "028260": "삼성물산",
+    "006400": "삼성SDI",
+    "051910": "LG화학",
+    "096770": "SK이노베이션",
+    "003670": "포스코퓨처엠",
+    "247540": "에코프로비엠",
+    "086520": "에코프로",
+    "010140": "삼성중공업",
+    "329180": "HD현대중공업",
+    "042660": "한화오션",
+    "009540": "HD한국조선해양",
+    "047810": "한국항공우주",
+    "012450": "한화에어로스페이스",
+    "079550": "LIG넥스원",
+    "010120": "LS ELECTRIC",
+    "000880": "한화",
+    "009830": "한화솔루션",
+    "034020": "두산에너빌리티",
+    "267260": "HD현대일렉트릭",
+    "298040": "효성중공업",
+    "064350": "현대로템",
+    "066570": "LG전자",
+    "011070": "LG이노텍",
+    "009150": "삼성전기",
+    "042700": "한미반도체",
+    "000990": "DB하이텍",
+    "039030": "이오테크닉스",
+    "240810": "원익IPS",
+    "403870": "HPSP",
+    "086790": "하나금융지주",
+    "316140": "우리금융지주",
+    "323410": "카카오뱅크",
+    "033780": "KT&G",
+    "090430": "아모레퍼시픽",
+    "051900": "LG생활건강",
+    "352820": "하이브",
+    "251270": "넷마블",
+    "259960": "크래프톤",
+    "263750": "펄어비스",
+}
+
+DEFAULT_CANDIDATE_KEYWORDS = {
+    "market": [
+        "코스피 외국인 기관 수급",
+        "코스닥 외국인 기관 수급",
+        "원달러 환율 한국 증시",
+        "미국 금리 나스닥 반도체",
+        "필라델피아 반도체 지수",
+    ],
+    "themes": [
+        "AI 반도체 HBM",
+        "전력기기 변압기 전력망",
+        "방산 수출 K방산",
+        "조선 LNG선 수주",
+        "바이오시밀러 ADC 항암제",
+        "2차전지 전고체 배터리",
+        "밸류업 저PBR 주주환원",
+    ],
+    "selection_signals": [
+        "실적 서프라이즈 목표주가 상향",
+        "외국인 순매수 기관 순매수",
+        "신규 수주 공급 계약",
+        "자사주 소각 배당 확대",
+        "52주 신고가 거래대금 증가",
+    ],
+    "risk_signals": [
+        "실적 쇼크 목표주가 하향",
+        "유상증자 전환사채 CB",
+        "거래정지 불성실공시",
+        "소송 제재 리콜",
+        "수요 둔화 공급 과잉",
+    ],
+}
+
+_CANDIDATE_CATEGORY_WEIGHTS = {
+    "selection_signals": 3,
+    "themes": 2,
+    "market": 1,
+    "risk_signals": -2,
 }
 
 
@@ -71,9 +159,93 @@ def _credentials() -> tuple[str, str]:
     return client_id, client_secret
 
 
-def _search(query: str, display: int, sort: str) -> list[dict[str, Any]]:
+def _quota_state_path() -> Path:
+    config = get_config()
+    configured = str(config.get("naver_rate_limit_state_path") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    cache_dir = Path(config.get("data_cache_dir") or Path.home() / ".tradingagents" / "cache")
+    return cache_dir / "naver_search_quota.json"
+
+
+@contextmanager
+def _locked_quota_state(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            if path.exists():
+                try:
+                    state = json.loads(path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    state = {}
+            else:
+                state = {}
+            yield state
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            tmp_path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            tmp_path.replace(path)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _reserve_quota_slot() -> None:
+    config = get_config()
+    if not config.get("naver_rate_limit_enabled", True):
+        return
+
+    per_second_limit = int(config.get("naver_rate_limit_per_second", 9))
+    daily_limit = int(config.get("naver_rate_limit_daily", 24000))
+    if per_second_limit <= 0 and daily_limit <= 0:
+        return
+
+    path = _quota_state_path()
+    while True:
+        now = time.time()
+        current_second = str(int(now))
+        today = datetime.now().strftime("%Y-%m-%d")
+        wait_seconds = 0.0
+        with _locked_quota_state(path) as state:
+            if state.get("date") != today:
+                state.clear()
+                state["date"] = today
+                state["daily_count"] = 0
+                state["seconds"] = {}
+
+            seconds = state.setdefault("seconds", {})
+            # Keep only the current and previous second for easy inspection
+            # while avoiding unbounded ledger growth.
+            previous_second = str(int(now) - 1)
+            state["seconds"] = {
+                key: value
+                for key, value in seconds.items()
+                if key in {previous_second, current_second}
+            }
+            seconds = state["seconds"]
+
+            daily_count = int(state.get("daily_count", 0))
+            if daily_limit > 0 and daily_count >= daily_limit:
+                raise VendorRateLimitError(
+                    f"Naver Search API daily quota exhausted: {daily_count}/{daily_limit}."
+                )
+
+            second_count = int(seconds.get(current_second, 0))
+            if per_second_limit <= 0 or second_count < per_second_limit:
+                seconds[current_second] = second_count + 1
+                state["daily_count"] = daily_count + 1
+                state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+                return
+
+            wait_seconds = max(0.05, int(now) + 1 - now + 0.05)
+
+        time.sleep(wait_seconds)
+
+
+def _search_once(query: str, display: int, sort: str) -> requests.Response:
     client_id, client_secret = _credentials()
-    response = requests.get(
+    _reserve_quota_slot()
+    return requests.get(
         NAVER_NEWS_URL,
         params={"query": query, "display": display, "start": 1, "sort": sort},
         headers={
@@ -82,8 +254,28 @@ def _search(query: str, display: int, sort: str) -> list[dict[str, Any]]:
         },
         timeout=10,
     )
-    if response.status_code == 429:
-        raise VendorRateLimitError("Naver Search API rate limit reached.")
+
+
+def _search(query: str, display: int, sort: str) -> list[dict[str, Any]]:
+    config = get_config()
+    retries = int(config.get("naver_rate_limit_retries", 2))
+    backoff = float(config.get("naver_rate_limit_backoff_seconds", 1.0))
+    response = None
+    for attempt in range(retries + 1):
+        response = _search_once(query, display, sort)
+        if response.status_code != 429:
+            break
+        if attempt >= retries:
+            raise VendorRateLimitError("Naver Search API rate limit reached.")
+        retry_after = response.headers.get("Retry-After")
+        try:
+            wait_seconds = float(retry_after) if retry_after else backoff * (2 ** attempt)
+        except ValueError:
+            wait_seconds = backoff * (2 ** attempt)
+        time.sleep(max(wait_seconds, 0.1))
+
+    if response is None:
+        raise RuntimeError("Naver Search API request was not attempted.")
     if response.status_code >= 400:
         raise RuntimeError(f"Naver Search API error {response.status_code}: {response.text}")
     return response.json().get("items", [])
@@ -227,6 +419,173 @@ def collect_news_naver(
             }
         )
     return rows
+
+
+def _candidate_keywords() -> dict[str, list[str]]:
+    config = get_config()
+    configured = config.get("naver_candidate_keywords") or {}
+    if not isinstance(configured, dict):
+        return DEFAULT_CANDIDATE_KEYWORDS
+    merged = {key: list(value) for key, value in DEFAULT_CANDIDATE_KEYWORDS.items()}
+    for category, queries in configured.items():
+        if isinstance(queries, str):
+            merged[category] = [queries]
+        elif isinstance(queries, list):
+            merged[category] = [str(query) for query in queries if str(query).strip()]
+    return merged
+
+
+def _candidate_symbol_map() -> dict[str, str]:
+    config = get_config()
+    return {
+        **DEFAULT_CANDIDATE_SYMBOL_MAP,
+        **config.get("naver_news_query_map", {}),
+    }
+
+
+def collect_keyword_news_naver(
+    query: str,
+    start_date: str,
+    end_date: str,
+    *,
+    category: str = "custom",
+    display: int | None = None,
+    sort: str | None = None,
+) -> list[dict[str, Any]]:
+    """Collect structured Naver news rows for one discovery keyword."""
+    config = get_config()
+    resolved_display = int(
+        display if display is not None else config.get("naver_news_display", config.get("news_article_limit", 10))
+    )
+    resolved_sort = sort or config.get("naver_news_sort", "date")
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    rows: list[dict[str, Any]] = []
+    for raw in _search(query, display=resolved_display, sort=resolved_sort):
+        pub_dt = _parse_pub_date(raw.get("pubDate"))
+        if pub_dt is not None and not (start_dt <= pub_dt <= end_dt + relativedelta(days=1)):
+            continue
+        rows.append(
+            {
+                "category": category,
+                "query": query,
+                "title": _strip_html(str(raw.get("title", "No title"))),
+                "description": _strip_html(str(raw.get("description", ""))),
+                "link": raw.get("originallink") or raw.get("link") or "",
+                "naver_link": raw.get("link") or "",
+                "published_at": pub_dt.isoformat(timespec="minutes") if pub_dt else None,
+                "source": "Naver Search API",
+            }
+        )
+    return rows
+
+
+def collect_candidate_news_naver(
+    start_date: str,
+    end_date: str,
+    *,
+    categories: list[str] | None = None,
+    display: int | None = None,
+    sort: str | None = None,
+    extra_queries: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Collect market/theme/signal news used to discover candidate stocks."""
+    keyword_map = _candidate_keywords()
+    selected_categories = categories or list(keyword_map)
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_rows(query: str, category: str) -> None:
+        for row in collect_keyword_news_naver(
+            query,
+            start_date,
+            end_date,
+            category=category,
+            display=display,
+            sort=sort,
+        ):
+            key = (row.get("link") or row.get("naver_link") or row.get("title", ""), row["query"])
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(row)
+
+    for category in selected_categories:
+        for query in keyword_map.get(category, []):
+            add_rows(query, category)
+    for query in extra_queries or []:
+        if query.strip():
+            add_rows(query.strip(), "custom")
+    return rows
+
+
+def rank_candidate_tickers(
+    articles: list[dict[str, Any]],
+    *,
+    symbol_map: dict[str, str] | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Rank known Korean tickers mentioned in discovery news rows."""
+    candidates = symbol_map or _candidate_symbol_map()
+    scores: dict[str, dict[str, Any]] = {}
+    for article in articles:
+        text = f"{article.get('title', '')} {article.get('description', '')}"
+        category = str(article.get("category", "custom"))
+        weight = _CANDIDATE_CATEGORY_WEIGHTS.get(category, 1)
+        for code, name in candidates.items():
+            base = _base_symbol(code)
+            aliases = {base, str(name)}
+            if str(name).upper() == "NAVER":
+                aliases.add("네이버")
+            if not any(alias and alias in text for alias in aliases):
+                continue
+            ticker = f"{base}.KS" if base.isdigit() else code
+            row = scores.setdefault(
+                ticker,
+                {
+                    "ticker": ticker,
+                    "name": name,
+                    "score": 0,
+                    "mentionCount": 0,
+                    "positiveSignalCount": 0,
+                    "riskSignalCount": 0,
+                    "categories": {},
+                    "queries": {},
+                    "articles": [],
+                },
+            )
+            row["score"] += weight
+            row["mentionCount"] += 1
+            if category == "selection_signals":
+                row["positiveSignalCount"] += 1
+            if category == "risk_signals":
+                row["riskSignalCount"] += 1
+            row["categories"][category] = row["categories"].get(category, 0) + 1
+            query = str(article.get("query", ""))
+            row["queries"][query] = row["queries"].get(query, 0) + 1
+            if len(row["articles"]) < 5:
+                row["articles"].append(
+                    {
+                        "title": article.get("title"),
+                        "query": article.get("query"),
+                        "category": category,
+                        "published_at": article.get("published_at"),
+                        "link": article.get("link"),
+                    }
+                )
+
+    ranked = sorted(
+        scores.values(),
+        key=lambda row: (
+            row["score"],
+            row["positiveSignalCount"],
+            row["mentionCount"],
+            -row["riskSignalCount"],
+            row["ticker"],
+        ),
+        reverse=True,
+    )
+    return ranked[:limit]
 
 
 def get_news_naver(ticker: str, start_date: str, end_date: str) -> str:

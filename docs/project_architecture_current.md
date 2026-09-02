@@ -1,6 +1,6 @@
 # TradingAgents 프로젝트 동작 구조 정리
 
-작성 기준: 2026-07-09 현재 로컬 프로젝트 상태  
+작성 기준: 2026-09-03 현재 로컬 프로젝트 상태  
 범위: 기존 TradingAgents 구조 + 공용 `.env` + 한국 종목/Naver 뉴스 + Toss API 주문 dry-run/실주문 연동
 
 ## 1. 프로젝트 목표
@@ -12,6 +12,10 @@ TradingAgents는 여러 LLM agent가 금융 데이터를 수집하고 토론하�
 - 미국/글로벌 종목뿐 아니라 한국 종목을 `005930.KS`, `035720.KQ` 같은 Yahoo Finance 표기로 분석
 - Naver Search API를 TradingAgents 내부 독립 news vendor로 사용
 - 공용 `/Users/leejang2/Project/.env`에서 OpenAI, Naver, Toss API 키를 읽음
+- 기본 운용 목표를 자본금 10,000,000원 기준 한국 종목 당일 단타 모의투자로 설정
+- 일 목표 수익률은 1%, 즉 일 목표 수익금 100,000원으로 설정
+- 종목당 기본 진입 예산은 자본금의 10%, 즉 1,000,000원으로 설정
+- `main.py` 기본 실행은 한국 정규장 09:00-15:30, 월-금 기준으로 매일 1회 모의투자를 수행
 - 최종 Portfolio Manager 판단을 Toss 주문 계획으로 변환
 - 기본은 `dry-run` 모의 체결 기록, 명시적으로 `--execute`를 줄 때만 Toss 실제 주문 전송
 

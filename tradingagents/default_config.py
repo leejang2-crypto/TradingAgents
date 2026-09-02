@@ -20,6 +20,9 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_BENCHMARK_TICKER":     "benchmark_ticker",
     "TRADINGAGENTS_TEMPERATURE":          "temperature",
     "TRADINGAGENTS_LLM_MAX_RETRIES":      "llm_max_retries",
+    "TRADINGAGENTS_LLM_TIMEOUT":          "llm_timeout",
+    "TRADINGAGENTS_TRADING_STYLE":        "trading_style",
+    "TRADINGAGENTS_DAILY_TARGET_RETURN":  "daily_target_return",
     "TRADINGAGENTS_NEWS_DATA_VENDOR":     "news_data_vendor",
     # Provider-specific reasoning/thinking knobs (None = each provider's own
     # default). Settable here for non-interactive runs; the CLI also offers an
@@ -128,12 +131,19 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # provider/SDK at its own default (usually 2). Raise it to ride out bursty
     # 429 throttling on rate-limited deployments instead of aborting a run (#1091).
     "llm_max_retries": None,
+    # Per-request LLM timeout in seconds. None keeps provider SDK defaults.
+    "llm_timeout": None,
     # Checkpoint/resume: when True, LangGraph saves state after each node
     # so a crashed run can resume from the last successful step.
     "checkpoint_enabled": False,
     # Output language for analyst reports and final decision
     # Internal agent debate stays in English for reasoning quality
     "output_language": "English",
+    # Default paper-trading objective. The CLI runner expands this into a full
+    # trading_objective dict with capital, target profit, and per-trade budget.
+    "trading_style": "intraday-scalping",
+    "daily_target_return": "0.01",
+    "trading_objective": {},
     # Debate and discussion settings
     "max_debate_rounds": 1,
     "max_risk_discuss_rounds": 1,
@@ -157,6 +167,16 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # NAVER_CLIENT_ID and NAVER_CLIENT_SECRET when selected as a news vendor.
     "naver_news_display": 10,
     "naver_news_sort": "date",
+    # Prevent Naver Search API 429s by controlling quota before each request.
+    # Naver Search API is commonly treated as 10 req/sec and 25,000 req/day;
+    # keep a small safety margin like the Redis-based approach described in:
+    # https://velog.io/@shwj203/네이버-API-429-Too-Many-Requests-오류-해결기
+    "naver_rate_limit_enabled": True,
+    "naver_rate_limit_per_second": 9,
+    "naver_rate_limit_daily": 24000,
+    "naver_rate_limit_state_path": "",
+    "naver_rate_limit_retries": 2,
+    "naver_rate_limit_backoff_seconds": 1.0,
     "naver_news_query_map": {},
     # When set, Naver news tools first read structured articles collected by
     # scripts/collect_naver_news.py or the Korea analysis runner. This lets all
@@ -169,6 +189,40 @@ DEFAULT_CONFIG = _apply_env_overrides({
         "한국은행 금리 물가 경기",
         "미국 연준 금리 나스닥 반도체",
     ],
+    # Keyword buckets used by scripts/discover_naver_candidates.py. These are
+    # broad market/theme/signal queries, not finance.naver.com scraping.
+    "naver_candidate_keywords": {
+        "market": [
+            "코스피 외국인 기관 수급",
+            "코스닥 외국인 기관 수급",
+            "원달러 환율 한국 증시",
+            "미국 금리 나스닥 반도체",
+            "필라델피아 반도체 지수",
+        ],
+        "themes": [
+            "AI 반도체 HBM",
+            "전력기기 변압기 전력망",
+            "방산 수출 K방산",
+            "조선 LNG선 수주",
+            "바이오시밀러 ADC 항암제",
+            "2차전지 전고체 배터리",
+            "밸류업 저PBR 주주환원",
+        ],
+        "selection_signals": [
+            "실적 서프라이즈 목표주가 상향",
+            "외국인 순매수 기관 순매수",
+            "신규 수주 공급 계약",
+            "자사주 소각 배당 확대",
+            "52주 신고가 거래대금 증가",
+        ],
+        "risk_signals": [
+            "실적 쇼크 목표주가 하향",
+            "유상증자 전환사채 CB",
+            "거래정지 불성실공시",
+            "소송 제재 리콜",
+            "수요 둔화 공급 과잉",
+        ],
+    },
     # Data vendor configuration
     # Category-level configuration (default for all tools in category).
     # The configured value is the exact vendor chain — requests are NOT silently
