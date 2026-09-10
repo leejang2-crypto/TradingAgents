@@ -1,6 +1,6 @@
 # TradingAgents 프로젝트 동작 구조 정리
 
-작성 기준: 2026-09-03 현재 로컬 프로젝트 상태  
+작성 기준: 2026-09-10 현재 로컬 프로젝트 상태
 범위: 기존 TradingAgents 구조 + 공용 `.env` + 한국 종목/Naver 뉴스 + Toss API 주문 dry-run/실주문 연동
 
 ## 1. 프로젝트 목표
@@ -16,9 +16,15 @@ TradingAgents는 여러 LLM agent가 금융 데이터를 수집하고 토론하�
 - 일 목표 수익률은 1%, 즉 일 목표 수익금 100,000원으로 설정
 - 종목당 기본 진입 예산은 자본금의 10%, 즉 1,000,000원으로 설정
 - `main.py` 기본 실행은 한국 정규장 09:00-15:30, 월-금 기준으로 매일 1회 모의투자를 수행
-- `main.py --monitor --monitor-host tailscale` 실행 시 Tailscale에 로그인된 외부 모바일 데이터 기기의 웹브라우저에서 모의투자 상태를 읽기 전용으로 확인
+- `Start-Live.command`는 동일한 후보 선정/단타 목표/정규장 스케줄을 `auto-live --yes`로 실행하며 주문 전송 단계만 Toss 실주문으로 전환
+- `main.py --monitor --monitor-host tailscale` 실행 시 Tailscale에 로그인된 외부 모바일 데이터 기기의 웹브라우저에서 모의투자 상태 확인 및 토큰 기반 매매 기준 설정
 - 최종 Portfolio Manager 판단을 Toss 주문 계획으로 변환
-- 기본은 `dry-run` 모의 체결 기록, 명시적으로 `--execute`를 줄 때만 Toss 실제 주문 전송
+- 기본은 `dry-run` 주문 의도 기록(`RECORDED`, 체결 미검증). 자동 실전은 `--scenario auto-live --yes`, 지정 종목 단발 실전은 `--scenario korea-execute --yes`로 실행
+- 웹 LLM 설정에서 OpenAI 전체, Ollama 전체, 역할별 혼합 선택. 혼합 기본값은 뉴스만 로컬이며 나머지는 OpenAI
+
+최신 검토 결과와 설정 방법은 [2026-09-10 검토 보고서](review_and_llm_settings_2026-09-10.md)를 참조합니다.
+현재 dry-run은 체결가, 현금 잔고, 보유 수량 및 실현손익을 관리하지 않습니다.
+따라서 자본금/일 수익률은 분석 목표이며, 실제 모의계좌 수익률 측정이나 당일 자동 청산을 보장하지 않습니다.
 
 ## 2. 실행 환경
 
@@ -853,6 +859,10 @@ Naver Search API는 검색 API입니다. 완전한 뉴스 DB나 정교한 sentim
 OpenAI 기본 실행 모델은 `gpt-5.5`입니다. 이 모델은 `model_catalog.py`의 OpenAI quick/deep 옵션에 등록되어 있어 known model warning 없이 실행됩니다.
 
 ## 19. 향후 개선 제안
+
+분석·매매 저장 및 역할별 경험 재사용은 [경험 메모리 안내](experience_learning.md)에
+정리되어 있습니다. 현재 한국 종목 매매 경로는 모드별 SQLite 경험 기록과 실행 ID별
+보고서 디렉터리를 사용합니다. 과거 보고서의 재사용이며 모델 가중치 재훈련은 아닙니다.
 
 1. Toss holdings 조회를 추가해 `Sell`/`Underweight` 시 실제 보유 수량 기반 매도 계획 생성
 2. Toss 현재가 조회를 분석 직후 호출해 BUY 수량을 더 정확히 계산

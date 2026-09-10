@@ -29,11 +29,14 @@ from tradingagents.agents.utils.agent_utils import (
 )
 from tradingagents.agents.utils.local_safe import hold_decision, validate_trading_state
 from tradingagents.agents.utils.memory import TradingMemoryLog
+from tradingagents.agents.utils.experience import ExperienceStore, ROLE_FIELDS
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.utils import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients import create_llm_client
 from tradingagents.llm_clients.timeout_wrapper import HardTimeoutLLM
+from tradingagents.llm_clients.experience_wrapper import ExperienceLLM
+from tradingagents.llm_clients.routing import DEEP_AGENTS
 from tradingagents.reporting import write_report_tree
 
 from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
@@ -94,6 +97,17 @@ class TradingAgentsGraph:
         os.makedirs(self.config["results_dir"], exist_ok=True)
 
         self.agent_llms = self._create_llms()
+
+        self.experience_contexts = {}
+        if self.config.get("experience_enabled"):
+            # Keep one wrapper per role even when several roles share a model.
+            self.agent_llms = {
+                role: ExperienceLLM(
+                    self.agent_llms.get(role, self.deep_thinking_llm if role in DEEP_AGENTS else self.quick_thinking_llm),
+                    lambda role=role: self.experience_contexts.get(role, ""),
+                )
+                for role in ROLE_FIELDS
+            }
 
         self.memory_log = TradingMemoryLog(self.config)
 
@@ -216,12 +230,12 @@ class TradingAgentsGraph:
         openai_quick = self._create_llm(
             provider="openai",
             model=self.config.get("hybrid_openai_quick_llm", self.config["quick_think_llm"]),
-            base_url=None,
+            base_url=self.config.get("hybrid_openai_backend_url"),
         )
         openai_deep = self._create_llm(
             provider="openai",
             model=self.config.get("hybrid_openai_deep_llm", self.config["deep_think_llm"]),
-            base_url=None,
+            base_url=self.config.get("hybrid_openai_backend_url"),
         )
         ollama_quick = self._create_llm(
             provider="ollama",
@@ -457,7 +471,8 @@ class TradingAgentsGraph:
         self.ticker = company_name
 
         # Resolve any pending memory-log entries for this ticker before the pipeline runs.
-        self._resolve_pending_entries(company_name)
+        if not self.config.get("experience_enabled"):
+            self._resolve_pending_entries(company_name)
 
         # Recompile with a checkpointer if the user opted in.
         if self.config.get("checkpoint_enabled"):
@@ -503,9 +518,19 @@ class TradingAgentsGraph:
 
     def _run_graph(self, company_name, trade_date, asset_type: str = "stock"):
         """Execute the graph and write the resulting state to disk and memory log."""
+        if self.config.get("experience_enabled"):
+            store = ExperienceStore(self.config["experience_db_path"])
+            run = store.get(self.config["experience_run_id"])
+            if (run["ticker"], run["trade_date"]) != (company_name, str(trade_date)):
+                raise ValueError("Experience run does not match the requested ticker/date.")
+            self.experience_contexts = store.contexts(self.config["experience_run_id"])
+            store.event(self.config["experience_run_id"], "MEMORY_RETRIEVED", {
+                "roles": list(self.experience_contexts),
+                "characters": {role: len(value) for role, value in self.experience_contexts.items()},
+            })
         # Initialize state — inject memory log context for PM and the
         # deterministically resolved instrument identity for all agents.
-        past_context = self.memory_log.get_past_context(company_name)
+        past_context = "" if self.config.get("experience_enabled") else self.memory_log.get_past_context(company_name)
         instrument_context = self.resolve_instrument_context(company_name, asset_type)
         init_agent_state = self.propagator.create_initial_state(
             company_name,
@@ -548,15 +573,19 @@ class TradingAgentsGraph:
         self._apply_local_safe_validation(final_state, company_name)
         self.curr_state = final_state
 
+        if self.config.get("experience_enabled"):
+            store.save_analysis(self.config["experience_run_id"], final_state)
+
         # Log state to disk.
         self._log_state(trade_date, final_state)
 
         # Store decision for deferred reflection on the next same-ticker run.
-        self.memory_log.store_decision(
-            ticker=company_name,
-            trade_date=trade_date,
-            final_trade_decision=final_state["final_trade_decision"],
-        )
+        if not self.config.get("experience_enabled"):
+            self.memory_log.store_decision(
+                ticker=company_name,
+                trade_date=trade_date,
+                final_trade_decision=final_state["final_trade_decision"],
+            )
 
         # Clear checkpoint on successful completion to avoid stale state.
         if self.config.get("checkpoint_enabled"):

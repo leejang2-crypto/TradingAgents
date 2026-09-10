@@ -38,6 +38,7 @@ class TestStockTwitsResilience:
             HTTPError("url", 503, "down", {}, None),
             TimeoutError("slow"),
         ],
+        ids=["incomplete-read", "http-503", "timeout"],
     )
     def test_transport_errors_return_placeholder(self, exc):
         with patch.object(stocktwits, "urlopen", return_value=_raise(exc)):

@@ -291,7 +291,7 @@ def _format_articles(
     kept = 0
     for raw in articles:
         pub_dt = _parse_pub_date(raw.get("pubDate"))
-        if pub_dt is not None and not (start_dt <= pub_dt <= end_dt + relativedelta(days=1)):
+        if pub_dt is not None and not (start_dt <= pub_dt < end_dt + relativedelta(days=1)):
             continue
         article_title = _strip_html(str(raw.get("title", "No title")))
         description = _strip_html(str(raw.get("description", "")))
@@ -325,7 +325,10 @@ def _load_collected_articles(path_value: str | None) -> list[dict[str, Any]]:
     path = Path(path_value).expanduser()
     if not path.exists() or path.suffix.lower() != ".json":
         return []
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
     if isinstance(payload, dict):
         articles = payload.get("articles", [])
         return articles if isinstance(articles, list) else []
@@ -346,11 +349,13 @@ def _collected_articles_for(
     base = _base_symbol(ticker)
     rows: list[dict[str, Any]] = []
     for article in _load_collected_articles(path_value):
+        if not isinstance(article, dict):
+            continue
         article_ticker = str(article.get("ticker", ""))
         if _base_symbol(article_ticker) != base:
             continue
         pub_dt = _parse_collected_date(article.get("published_at"))
-        if pub_dt is not None and not (start_dt <= pub_dt <= end_dt + relativedelta(days=1)):
+        if pub_dt is not None and not (start_dt <= pub_dt < end_dt + relativedelta(days=1)):
             continue
         rows.append(article)
     return rows
@@ -404,7 +409,7 @@ def collect_news_naver(
     rows: list[dict[str, Any]] = []
     for raw in _search(query, display=resolved_display, sort=resolved_sort):
         pub_dt = _parse_pub_date(raw.get("pubDate"))
-        if pub_dt is not None and not (start_dt <= pub_dt <= end_dt + relativedelta(days=1)):
+        if pub_dt is not None and not (start_dt <= pub_dt < end_dt + relativedelta(days=1)):
             continue
         rows.append(
             {
@@ -463,7 +468,7 @@ def collect_keyword_news_naver(
     rows: list[dict[str, Any]] = []
     for raw in _search(query, display=resolved_display, sort=resolved_sort):
         pub_dt = _parse_pub_date(raw.get("pubDate"))
-        if pub_dt is not None and not (start_dt <= pub_dt <= end_dt + relativedelta(days=1)):
+        if pub_dt is not None and not (start_dt <= pub_dt < end_dt + relativedelta(days=1)):
             continue
         rows.append(
             {

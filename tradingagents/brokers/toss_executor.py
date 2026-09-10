@@ -55,8 +55,14 @@ def plan_from_decision(
 ) -> TossOrderPlan:
     rating = parse_rating(decision_text)
     broker_symbol = toss_symbol(symbol)
+    if not min_quantity.is_finite() or min_quantity <= 0:
+        raise ValueError("min_quantity must be finite and positive.")
+    if price is not None and (not price.is_finite() or price <= 0):
+        raise ValueError("price must be finite and positive.")
     if rating in BUY_RATINGS:
-        budget = max_order_amount or _env_decimal("TRADINGAGENTS_TOSS_MAX_ORDER_AMOUNT", "100000")
+        budget = max_order_amount if max_order_amount is not None else _env_decimal("TRADINGAGENTS_TOSS_MAX_ORDER_AMOUNT", "100000")
+        if not budget.is_finite() or budget <= 0:
+            raise ValueError("Order budget must be finite and positive.")
         quantity = None
         order_amount = None
         if price and price > 0:
@@ -115,7 +121,7 @@ def order_payload(plan: TossOrderPlan) -> dict[str, Any]:
 def _default_paper_trade_path() -> Path:
     return Path(os.environ.get(
         "TRADINGAGENTS_PAPER_TRADE_LOG",
-        "/Users/leejang2/Project/TradingAgents/.local/paper_trades/trades.jsonl",
+        str(Path(__file__).resolve().parents[2] / ".local" / "paper_trades" / "trades.jsonl"),
     ))
 
 
@@ -124,14 +130,18 @@ def record_paper_trade(
     payload: dict[str, Any],
     *,
     log_path: str | Path | None = None,
+    experience_run_id: str | None = None,
 ) -> dict[str, Any]:
     path = Path(log_path) if log_path else _default_paper_trade_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     record = {
         "paperTradeId": f"paper-{int(time.time())}-{uuid.uuid4().hex[:8]}",
         "recordedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "status": "FILLED",
+        # An order intent has no fill price, cash ledger, or position accounting.
+        "status": "RECORDED",
+        "fillVerified": False,
         "mode": "dry-run",
+        "experienceRunId": experience_run_id,
         "plan": plan.__dict__,
         "payload": payload,
     }
@@ -146,14 +156,17 @@ async def execute_plan(
     execute: bool = False,
     timeout: float = 10.0,
     paper_trade_log: str | Path | None = None,
+    live_order_log: str | Path | None = None,
+    experience_run_id: str | None = None,
 ) -> dict[str, Any]:
     payload = order_payload(plan)
     if not payload:
-        return {"executed": False, "dryRun": True, "plan": plan.__dict__, "payload": payload}
+        return {"executed": False, "dryRun": not execute, "plan": plan.__dict__, "payload": payload}
     if not execute:
-        paper = record_paper_trade(plan, payload, log_path=paper_trade_log)
+        paper = record_paper_trade(plan, payload, log_path=paper_trade_log, experience_run_id=experience_run_id)
         return {
-            "executed": True,
+            "executed": False,
+            "recorded": True,
             "simulated": True,
             "dryRun": True,
             "plan": plan.__dict__,
@@ -167,6 +180,30 @@ async def execute_plan(
     if not client_id or not client_secret or not account_seq:
         raise ValueError("TOSS_CLIENT_ID, TOSS_CLIENT_SECRET, and TOSS_ACCOUNT_SEQ are required.")
 
-    async with TossClient(client_id, client_secret, account_seq=account_seq, timeout=timeout) as client:
-        result = await client.create_order(payload)
-    return {"executed": True, "dryRun": False, "plan": plan.__dict__, "payload": payload, "result": result}
+    path = Path(live_order_log) if live_order_log else Path(__file__).resolve().parents[2] / ".local" / "live_orders" / "orders.jsonl"
+
+    def record(status: str, **extra: Any) -> dict[str, Any]:
+        entry = {
+            "recordedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "mode": "live", "status": status, "fillVerified": False,
+            "experienceRunId": experience_run_id,
+            "plan": plan.__dict__, "payload": payload, **extra,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        return entry
+
+    record("SUBMITTING")
+    try:
+        async with TossClient(client_id, client_secret, account_seq=account_seq, timeout=timeout) as client:
+            result = await client.create_order(payload)
+    except Exception as exc:
+        # A lost response does not prove rejection. Leave the client order ID
+        # available for reconciliation rather than automatically sending again.
+        record("UNCONFIRMED", error=str(exc))
+        raise
+    entry = record("SUBMITTED", result=result)
+    return {"executed": True, "dryRun": False, "plan": plan.__dict__, "payload": payload, "result": result, "liveOrder": {"path": str(path), "record": entry}}

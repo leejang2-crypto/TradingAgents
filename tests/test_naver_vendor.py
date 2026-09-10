@@ -5,12 +5,31 @@ from unittest import mock
 from tradingagents.dataflows import interface
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows import naver_news
+from datetime import datetime
+import json
 
 
 def test_naver_registered_as_news_vendor():
     assert "naver" in interface.VENDOR_LIST
     assert "naver" in interface.VENDOR_METHODS["get_news"]
     assert "naver" in interface.VENDOR_METHODS["get_global_news"]
+
+
+def test_naver_excludes_next_day_midnight_from_live_and_saved_news(tmp_path):
+    raw = [{"title": "Future item", "pubDate": "Fri, 11 Sep 2026 00:00:00 +0900"}]
+    with mock.patch.object(naver_news, "_search", return_value=raw):
+        assert naver_news.collect_news_naver("005930.KS", "2026-09-09", "2026-09-10") == []
+    rendered = naver_news._format_articles("news", raw, datetime(2026, 9, 9), datetime(2026, 9, 10))
+    assert "Future item" not in rendered
+    path = tmp_path / "news.json"
+    path.write_text(json.dumps({"articles": [{"ticker": "005930.KS", "published_at": "2026-09-11T00:00", "title": "Future item"}]}))
+    assert naver_news._collected_articles_for("005930.KS", "2026-09-09", "2026-09-10", path_value=str(path)) == []
+
+
+def test_corrupt_naver_snapshot_does_not_break_live_fallback(tmp_path):
+    path = tmp_path / "broken.json"
+    path.write_text("{broken")
+    assert naver_news._load_collected_articles(str(path)) == []
 
 
 def test_route_to_naver_news_vendor():

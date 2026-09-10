@@ -119,6 +119,54 @@ def test_monitor_status_file_round_trips(monkeypatch, tmp_path):
     assert snapshot["runtime"]["nextRunAfter"] == "2026-09-04T09:00:00+09:00"
 
 
+def test_trading_settings_save_and_apply(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "LOCAL_DIR", tmp_path)
+    args = argparse.Namespace(
+        paper_capital="10000000",
+        position_pct="0.10",
+        daily_target_return="0.01",
+        trading_style="intraday-scalping",
+        candidate_limit=20,
+        trade_candidates=3,
+        candidate_days=3,
+        candidate_categories="market,themes",
+        extra_queries="",
+        news_display=5,
+        market_open="09:00",
+        market_close="15:30",
+        holiday_dates="",
+        llm_timeout="180",
+    )
+
+    main.initialize_trading_settings(args)
+    saved = main.save_trading_settings({"paper_capital": "12000000", "trade_candidates": "4"})
+    main.apply_trading_settings(args)
+
+    assert saved["paper_capital"] == "12000000"
+    assert saved["trade_candidates"] == 4
+    assert args.paper_capital == "12000000"
+    assert args.trade_candidates == 4
+
+
+def test_trading_settings_reject_invalid_position_pct():
+    try:
+        main.validate_trading_settings({"position_pct": "1.5"})
+    except ValueError as exc:
+        assert "position_pct" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError")
+
+
+def test_monitor_token_is_created_once(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "LOCAL_DIR", tmp_path)
+
+    first = main.ensure_monitor_token()
+    second = main.ensure_monitor_token()
+
+    assert first == second
+    assert len(first) > 20
+
+
 def test_resolve_monitor_host_accepts_literal_host():
     assert main.resolve_monitor_host("127.0.0.1") == ("127.0.0.1", "127.0.0.1")
 

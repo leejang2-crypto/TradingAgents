@@ -48,6 +48,7 @@ def test_record_paper_trade_writes_jsonl(tmp_path):
     payload = order_payload(plan)
     result = record_paper_trade(plan, payload, log_path=tmp_path / "trades.jsonl")
     assert result["record"]["mode"] == "dry-run"
-    assert result["record"]["status"] == "FILLED"
+    assert result["record"]["status"] == "RECORDED"
+    assert result["record"]["fillVerified"] is False
     assert result["record"]["payload"]["symbol"] == "005930"
     assert (tmp_path / "trades.jsonl").read_text(encoding="utf-8").strip()
