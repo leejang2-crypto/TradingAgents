@@ -35,6 +35,7 @@
       el('manual-result-text').textContent = lines.join('\n') || '완료';
     }
     document.querySelectorAll('[data-action]').forEach(button => { button.disabled = sending || !state.available || !!state.pending; });
+    document.dispatchEvent(new Event('dashboard-data'));
   }
   async function refresh() {
     try {
@@ -42,7 +43,7 @@
       if (response.status === 401) { location.assign('/login'); return; }
       if (!response.ok) throw new Error('실행 상태 조회 실패');
       render(await response.json());
-    } catch (error) { el('control-message').textContent = error.message; }
+    } catch (error) { el('control-message').textContent = error.message; document.dispatchEvent(new Event('dashboard-data')); }
   }
   function dialog(kind, message) {
     el('run-dialog-title').textContent = kind === 'busy' ? '현재 작업 처리' : '실제 주문 실행 확인';
@@ -99,8 +100,9 @@
     } catch (error) { el('control-message').textContent = error.message; await refresh(); }
   });
   el('logout').addEventListener('click', async () => {
+    if (window.Dashboard && !window.Dashboard.canLogout()) return;
     const response = await fetch('/api/logout', {method: 'POST', headers, body: '{}'});
-    if (response.ok || response.status === 401) location.assign('/login');
+    if (response.ok || response.status === 401) { window.Dashboard?.saved(window.Dashboard.formSignature()); location.assign('/login'); }
   });
   refresh();
   setInterval(refresh, 3000);

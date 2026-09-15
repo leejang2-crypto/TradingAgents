@@ -833,15 +833,18 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
         simulation = toss.get("paperExecution")
         if simulation:
             order_label += " · " + simulation["status"] + (" · " + simulation["reason"] if simulation.get("reason") else "")
+        decision_text = str(analysis.get("error") or analysis.get("decision") or "-")
+        detail_key = _compact_text(str(analysis.get("ticker")) + ":" + str(analysis.get("reportPath")))
         analysis_rows.append(
             "<tr>"
             f"<td>{_compact_text(analysis.get('ticker'))}</td>"
             f"<td>{_compact_text(analysis.get('name') or candidate_names.get(analysis.get('ticker')))}</td>"
             f"<td>{_compact_text(analysis.get('candidateRank'))}</td>"
-            f"<td>{_compact_text(analysis.get('error') or analysis.get('decision'))}</td>"
+            f'<td><details class="analysis-detail" data-detail-key="analysis:{detail_key}"><summary>{_compact_text(decision_text[:100])}{"..." if len(decision_text) > 100 else ""}</summary><div class="analysis-content">{_compact_text(decision_text)}</div></details></td>'
             f"<td>{_compact_text(order_label)}</td>"
-            f"<td>{_compact_text(analysis.get('reportPath'))}</td>"
-            f"<td>{'<br>'.join(_compact_text(AGENT_LABELS.get(name, name) + ': ' + route['provider'] + ' / ' + route['model']) for name, route in (analysis.get('agentRouting') or {}).items() if name not in {'sentiment_analyst', 'fundamentals_analyst'}) or _compact_text(analysis.get('provider'))}</td>"
+            f'<td><details data-detail-key="report:{detail_key}"><summary>보고서 경로</summary><code>{_compact_text(analysis.get("reportPath"))}</code></details></td>'
+            f'<td><details data-detail-key="llm:{detail_key}"><summary>{_compact_text(analysis.get("provider"), "사용 LLM")}</summary>'
+            f"{'<br>'.join(_compact_text(AGENT_LABELS.get(name, name) + ': ' + route['provider'] + ' / ' + route['model']) for name, route in (analysis.get('agentRouting') or {}).items() if name not in {'sentiment_analyst', 'fundamentals_analyst'}) or _compact_text(analysis.get('provider'))}</details></td>"
             "</tr>"
         )
     return f"""<!doctype html>
@@ -852,6 +855,8 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
   <title>TradingAgents Monitor</title>
   <link rel="stylesheet" href="/assets/account.css">
   <link rel="stylesheet" href="/assets/control.css">
+  <link rel="stylesheet" href="/assets/dashboard.css">
+  <script src="/assets/dashboard.js" defer></script>
   <script src="/assets/account.js" defer></script>
   <script src="/assets/control.js" defer></script>
   <script src="/assets/positions.js" defer></script>
@@ -890,6 +895,7 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
       const form = event.currentTarget;
       const button = form.querySelector('button[type="submit"]');
       const message = document.getElementById("settings-message");
+      const submittedSignature = window.Dashboard?.formSignature();
       const payload = Object.fromEntries(new FormData(form).entries());
       payload.hybrid_agent_providers = {{}};
       for (const key of Object.keys(payload)) {{
@@ -914,6 +920,7 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
           throw new Error(data.error || "설정 저장 실패");
         }}
         message.textContent = "저장됐습니다. 다음 자동 실행부터 반영됩니다.";
+        window.Dashboard?.saved(submittedSignature);
       }} catch (error) {{
         message.textContent = "저장 실패: " + error.message;
       }} finally {{
@@ -927,6 +934,7 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
       document.querySelector('[name="provider"]').value = "hybrid";
       document.querySelectorAll('[name^="route_"]').forEach(el => {{ el.value = el.name === "route_news_analyst" ? "ollama" : "openai"; }});
       updateProvider();
+      document.getElementById('settings-form').dispatchEvent(new Event('input', {{bubbles: true}}));
     }}
     async function loadLocalModels() {{
       const status = document.getElementById("ollama-status");
@@ -949,7 +957,10 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
         const fresh = new DOMParser().parseFromString(await response.text(), "text/html");
         document.querySelectorAll("[data-live]").forEach(panel => {{
           const replacement = fresh.querySelector('[data-live="' + panel.dataset.live + '"]');
-          if (replacement) panel.replaceWith(replacement);
+          if (replacement) {{
+            if (window.Dashboard) window.Dashboard.replaceLive(panel, replacement);
+            else panel.replaceWith(replacement);
+          }}
         }});
         document.getElementById("connection-status").textContent = "연결됨";
       }} catch (error) {{ document.getElementById("connection-status").textContent = "서버 연결 끊김"; }}
@@ -958,13 +969,27 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
   </script>
 </head>
 <body>
-  <header>
+  <header id="dashboard-header">
+    <div class="header-title">
     <h1>TradingAgents Monitor</h1>
+    <button id="logout" type="button">로그아웃</button>
+    </div>
+    <div class="header-meta">
+    <div data-live="header-status"><strong class="mode-badge {'mode-live' if live else 'mode-paper'}">{'실투자 · 실제 주문' if live else '모의투자'}</strong><span>다음 분석: {_compact_text(runtime.get('nextRunAfter'))}</span></div>
     <div data-live="timestamp">Asia/Seoul {_compact_text(snapshot.get("now"))}</div>
     <div id="connection-status" role="status">연결됨</div>
-    <button id="logout" type="button">로그아웃</button>
+    </div>
+    <div id="global-job" role="status">현재 작업 확인 중</div>
+    <button id="global-warning" type="button" hidden></button>
   </header>
-  <main>
+  <nav id="dashboard-tabs" role="tablist" aria-label="대시보드 메뉴" hidden>
+    <button type="button" role="tab" id="tab-overview" aria-controls="view-overview" aria-selected="true" data-view="overview">현황</button>
+    <button type="button" role="tab" id="tab-analysis" aria-controls="view-analysis" aria-selected="false" data-view="analysis" tabindex="-1">분석</button>
+    <button type="button" role="tab" id="tab-history" aria-controls="view-history" aria-selected="false" data-view="history" tabindex="-1">거래 내역</button>
+    <button type="button" role="tab" id="tab-execution" aria-controls="view-execution" aria-selected="false" data-view="execution" tabindex="-1">실행</button>
+    <button type="button" role="tab" id="tab-settings" aria-controls="view-settings" aria-selected="false" data-view="settings" tabindex="-1">설정</button>
+  </nav>
+  <main id="dashboard-main">
     <section id="manual-panel">
       <h2>수동 실행</h2>
       <div class="control-toolbar">
@@ -1000,7 +1025,7 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
       <div id="positions-daily"></div>
       <p class="muted">매수일 포함 최대 2거래일. 자동 분석을 일시정지해도 보유 점검·청산은 계속됩니다.</p>
       <div class="account-scroll"><table><thead><tr><th>종목</th><th>관리 수량</th><th>평균 매입가</th><th>종목 수익률</th><th>익절가 / 손절가</th><th>매수일</th><th>최종 보유 한도</th><th>다음 거래일까지 이월 허용</th><th>청산 상태</th></tr></thead><tbody id="positions-body"></tbody></table></div>
-      <div id="entry-checks"></div>
+      <details data-detail-key="entry-checks"><summary>종목별 진입 검사</summary><div id="entry-checks"></div></details>
       <p id="positions-warning" role="status"></p>
       <details id="position-adoption" hidden><summary>기존 실계좌 보유분 편입</summary>
         <form id="position-adopt-form">
@@ -1011,8 +1036,9 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
           <p id="position-adopt-message" role="status"></p>
         </form>
       </details>
-      <h3>최근 주문 체결 확인</h3>
+      <div id="position-order-panel"><h3>최근 주문 체결 확인</h3>
       <div class="account-scroll"><table><thead><tr><th>종목</th><th>구분</th><th>주문 수량/금액</th><th>누적 체결 수량</th><th>상태</th><th>주문 ID</th></tr></thead><tbody id="position-orders"></tbody></table></div>
+      </div>
     </section>
     <section data-live="runtime">
       <h2>Runtime</h2>
@@ -1060,10 +1086,10 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
         <div class="metric"><div class="label">운영 모드</div><div class="value">{_compact_text(summary.get("runMode"))}</div></div>
       </div>
     </section>
-    <section>
+    <section id="settings-panel">
       <h2>Trading Settings</h2>
-      <form onsubmit="saveSettings(event)">
-        <h3>LLM 설정</h3>
+      <form id="settings-form" onsubmit="saveSettings(event)">
+        <details class="settings-group" data-detail-key="settings-llm"><summary>LLM 설정</summary>
         <div class="form-grid">
           <label>실행 제공자<select name="provider" onchange="updateProvider()">{options({"openai": "OpenAI 전체", "ollama": "Ollama 전체", "hybrid": "역할별 혼합"}, settings["provider"])}</select></label>
           {model_controls}
@@ -1075,13 +1101,15 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
         <div id="ollama-status" class="message" role="status"></div>
         <button type="button" onclick="newsLocalPreset()">뉴스만 로컬로 설정</button>
         <div id="agent-routing" class="form-grid">{role_controls}</div>
-        <h3>자본과 목표</h3>
+        </details>
+        <details class="settings-group" data-detail-key="settings-capital"><summary>자본과 목표</summary>
         <div class="form-grid">
           <label>자본금 KRW<input name="paper_capital" inputmode="numeric" value="{_compact_text(settings.get("paper_capital", DEFAULT_PAPER_CAPITAL))}"></label>
           <label>종목당 비중<input name="position_pct" inputmode="decimal" value="{_compact_text(settings.get("position_pct", DEFAULT_POSITION_PCT))}"></label>
           <label>전략 스타일<input name="trading_style" value="{_compact_text(settings.get("trading_style", DEFAULT_TRADING_STYLE))}"></label>
         </div>
-        <h3>후보 선정</h3>
+        </details>
+        <details class="settings-group" data-detail-key="settings-candidates"><summary>후보 선정</summary>
         <div class="form-grid">
           <label>저장 후보 수<input name="candidate_limit" inputmode="numeric" value="{_compact_text(settings.get("candidate_limit", 20))}"></label>
           <label>분석/매매 후보 수<input name="trade_candidates" inputmode="numeric" value="{_compact_text(settings.get("trade_candidates", 3))}"></label>
@@ -1094,12 +1122,14 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
         <label>추가 검색 키워드
           <textarea name="extra_queries">{_compact_text(settings.get("extra_queries", ""), "")}</textarea>
         </label>
-        <h3>단타 매매 기준</h3>
+        </details>
+        <details class="settings-group" data-detail-key="settings-intraday" open><summary>단타 매매 기준</summary>
         <div class="form-grid">
           <label>분봉 진입 전략<select name="entry_strategy">{options({'breakout': '15분 고점 돌파', 'pullback': 'VWAP 눌림목 회복'}, settings['entry_strategy'])}</select></label>
           {intraday_controls}
         </div>
-        <h3>운영 시간</h3>
+        </details>
+        <details class="settings-group" data-detail-key="settings-hours"><summary>운영 시간</summary>
         <div class="form-grid">
           <label>보유 점검 주기 (초)<input name="position_check_seconds" type="number" min="10" max="300" value="{settings.get('position_check_seconds', 30)}"></label>
           <label>장 종료 전 청산 시작 (분)<input name="liquidation_minutes" type="number" min="5" max="120" value="{settings.get('liquidation_minutes', 15)}"></label>
@@ -1113,22 +1143,23 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
         <label>휴장일 YYYY-MM-DD, 쉼표 구분
           <input name="holiday_dates" value="{_compact_text(settings.get("holiday_dates", ""), "")}">
         </label>
-        <button type="submit">설정 저장</button>
-        <div id="settings-message" class="message" role="status"></div>
+        </details>
+        <div class="settings-savebar"><button type="submit">설정 저장</button>
+        <span id="settings-dirty" role="status"></span><div id="settings-message" class="message" role="status"></div></div>
       </form>
-      <p class="muted"><code>{_compact_text(snapshot.get("settingsPath"))}</code></p>
+      <details data-detail-key="settings-path"><summary>설정 파일 경로</summary><p class="muted"><code>{_compact_text(snapshot.get("settingsPath"))}</code></p></details>
     </section>
     <section data-live="analyses">
       <h2>Latest Analyses</h2>
       <table><thead><tr><th>Ticker</th><th>종목명</th><th>Rank</th><th>Decision / Error</th><th>Order</th><th>Report</th><th>사용 LLM</th></tr></thead>
       <tbody>{''.join(analysis_rows) or '<tr><td colspan="7">No analysis yet</td></tr>'}</tbody></table>
-      <p><code>{_compact_text(snapshot.get("latestSummaryPath"))}</code></p>
+      <details data-detail-key="analysis-path"><summary>분석 요약 파일 경로</summary><p><code>{_compact_text(snapshot.get("latestSummaryPath"))}</code></p></details>
     </section>
     <section data-live="candidates">
       <h2>Candidate Ranking</h2>
       <table><thead><tr><th>Ticker</th><th>Name</th><th>Score</th><th>Mentions</th><th>Positive</th><th>Risk</th></tr></thead>
       <tbody>{''.join(candidate_rows) or '<tr><td colspan="6">No candidates yet</td></tr>'}</tbody></table>
-      <p><code>{_compact_text(snapshot.get("latestCandidatePath"))}</code></p>
+      <details data-detail-key="candidate-path"><summary>후보 파일 경로</summary><p><code>{_compact_text(snapshot.get("latestCandidatePath"))}</code></p></details>
     </section>
     <section data-live="trades">
       <h2>{'Recent Live Orders' if live else 'Recent Paper Trades'}</h2>
@@ -1186,7 +1217,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
     def _get(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path in {"/assets/account.js", "/assets/account.css", "/assets/control.js", "/assets/control.css", "/assets/login.js", "/assets/positions.js"}:
+        if parsed.path in {"/assets/account.js", "/assets/account.css", "/assets/control.js", "/assets/control.css", "/assets/login.js", "/assets/positions.js", "/assets/dashboard.js", "/assets/dashboard.css"}:
             name = parsed.path.rsplit("/", 1)[-1]
             payload = (PROJECT_DIR / "tradingagents" / "monitoring" / name).read_bytes()
             self.send_response(200)

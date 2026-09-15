@@ -121,6 +121,8 @@ def test_account_refresh_never_changes_trading_settings(monkeypatch):
 def test_account_assets_and_controls_are_available():
     assert request("GET", "/assets/account.js")[0] == 200
     assert request("GET", "/assets/account.css")[0] == 200
+    assert request("GET", "/assets/dashboard.js")[0] == 200
+    assert request("GET", "/assets/dashboard.css")[0] == 200
     assert request("GET", "/assets/../main.py")[0] == 404
     status, body = request("GET", "/")
     assert status == 200 and b'account-results' in body

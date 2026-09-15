@@ -59,6 +59,7 @@
         (account?.orders || []).map(o => [o.orderedAt, o.symbol, o.side, o.currency, fmt(o.execution?.filledQuantity), fmt(o.execution?.averageFilledPrice), o.status]), '최근 주문 조회 전 또는 내역 없음');
       if (account?.ordersTruncated) el('account-orders').append(cell('p', '최근 30일 주문 중 첫 페이지입니다. 추가 주문이 있습니다.'));
     }
+    document.dispatchEvent(new Event('dashboard-data'));
   }
   async function load(refresh = false) {
     const mode = document.querySelector('[name="account_mode"]:checked').value;
@@ -82,7 +83,7 @@
     el('account-load').addEventListener('click', () => load());
     el('account-refresh').addEventListener('click', () => load(true));
     document.querySelectorAll('[name="account_mode"],[name="return_period"],#account-date').forEach(input => input.addEventListener('change', () => {
-      sequence++; el('account-results').hidden = true; if (loaded) load();
+      sequence++; el('account-results').hidden = true; document.dispatchEvent(new Event('dashboard-data')); if (loaded) load();
     }));
     setInterval(() => { if (loaded) load(); }, 30000);
   });

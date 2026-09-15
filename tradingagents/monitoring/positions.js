@@ -46,7 +46,8 @@
         return row;
       });
       el('position-orders').replaceChildren(...orders);
-    } catch (error) { el('positions-status').textContent = error.message; }
+      document.dispatchEvent(new Event('dashboard-data'));
+    } catch (error) { el('positions-status').textContent = error.message; document.dispatchEvent(new Event('dashboard-data')); }
   }
   el('position-adopt-form').addEventListener('submit', async event => {
     event.preventDefault();
