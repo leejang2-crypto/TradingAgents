@@ -14,8 +14,9 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   exit 1
 fi
 
-print -r -- "TradingAgents: DRY RUN (order records only; no real Toss orders)"
-print -r -- "Daily market schedule. Dashboard URL will appear below."
+print -r -- "TradingAgents: DRY RUN (simulated account; no real Toss orders)"
+print -r -- "09:20 and 13:00 analysis; holdings monitored from market open. Default: hybrid LLMs."
+print -r -- "Dashboard URL will appear below."
 print -r -- "Press Ctrl+C to stop. Keep this Terminal window open."
 
 # Keep the Mac awake while the scheduler runs. Display sleep is still allowed.

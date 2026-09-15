@@ -19,7 +19,7 @@ NEWS_ONLY_ROUTING = {
     name: "ollama" if name == "news_analyst" else "openai" for name in AGENT_LABELS
 }
 LLM_DEFAULTS = {
-    "provider": "openai",
+    "provider": "hybrid",
     "openai_quick_model": "gpt-5.5",
     "openai_deep_model": "gpt-5.5",
     "ollama_quick_model": "qwen3:8b",

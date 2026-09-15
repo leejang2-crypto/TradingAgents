@@ -65,7 +65,7 @@ def test_invalid_http_requests_return_400(length, body):
 def test_settings_http_rejects_wrong_token():
     status, _ = request("POST", "/api/settings", b'{"provider":"ollama"}', token="wrong")
     assert status == 401
-    assert main.load_trading_settings()["provider"] == "openai"
+    assert main.load_trading_settings()["provider"] == "hybrid"
 
 
 def test_local_model_list_uses_only_loopback(monkeypatch):
@@ -85,3 +85,43 @@ def test_page_returns_model_selection_and_no_token():
     assert status == 200
     assert b'name="provider"' in body
     assert b"test-token" not in body
+
+
+def test_account_endpoints_require_token(monkeypatch):
+    reader = Mock()
+    refresher = Mock()
+    monkeypatch.setattr(main, "account_view", reader)
+    monkeypatch.setattr(main, "refresh_account", refresher)
+    assert request("GET", "/api/account?mode=live", token="wrong")[0] == 401
+    assert request("POST", "/api/account/refresh", b'{"mode":"live"}', token="wrong")[0] == 401
+    reader.assert_not_called()
+    refresher.assert_not_called()
+
+
+def test_account_http_periods_and_invalid_parameters():
+    for unit in ("day", "week", "month", "year"):
+        status, body = request("GET", "/api/account?mode=dry-run&period=" + unit)
+        result = json.loads(body)
+        assert status == 200
+        assert result["account"]["initialCapital"] == "10000000.00"
+        assert result["unit"] == unit
+    assert request("GET", "/api/account?mode=invalid")[0] == 503
+    assert request("GET", "/api/account?period=invalid")[0] == 503
+
+
+def test_account_refresh_never_changes_trading_settings(monkeypatch):
+    before = main.load_trading_settings()
+    refresh = Mock()
+    monkeypatch.setattr(main, "refresh_account", refresh)
+    assert request("POST", "/api/account/refresh", b'{"mode":"live"}')[0] == 200
+    refresh.assert_called_once_with(main.LOCAL_DIR, "live", "10000000")
+    assert main.load_trading_settings() == before
+
+
+def test_account_assets_and_controls_are_available():
+    assert request("GET", "/assets/account.js")[0] == 200
+    assert request("GET", "/assets/account.css")[0] == 200
+    assert request("GET", "/assets/../main.py")[0] == 404
+    status, body = request("GET", "/")
+    assert status == 200 and b'account-results' in body
+    assert b'name="return_period"' in body

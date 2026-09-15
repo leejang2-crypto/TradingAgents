@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from tradingagents.agents.utils.rating import parse_rating
+from tradingagents.monitoring.control import RunStopped, checkpoint
 
 from .toss_client import TossClient
 
@@ -131,6 +132,7 @@ def record_paper_trade(
     *,
     log_path: str | Path | None = None,
     experience_run_id: str | None = None,
+    simulation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     path = Path(log_path) if log_path else _default_paper_trade_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -144,7 +146,10 @@ def record_paper_trade(
         "experienceRunId": experience_run_id,
         "plan": plan.__dict__,
         "payload": payload,
+        "simulation": simulation,
     }
+    if simulation:
+        record["status"] = simulation["status"]
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
     return {"path": str(path), "record": record}
@@ -158,12 +163,33 @@ async def execute_plan(
     paper_trade_log: str | Path | None = None,
     live_order_log: str | Path | None = None,
     experience_run_id: str | None = None,
+    paper_account_path: str | Path | None = None,
+    paper_capital: str = "10000000",
 ) -> dict[str, Any]:
+    checkpoint("order-preparation")
     payload = order_payload(plan)
     if not payload:
         return {"executed": False, "dryRun": not execute, "plan": plan.__dict__, "payload": payload}
     if not execute:
-        paper = record_paper_trade(plan, payload, log_path=paper_trade_log, experience_run_id=experience_run_id)
+        simulation = None
+        if paper_account_path:
+            from .account_service import fetch_quotes
+            from .paper_account import PaperAccount
+            account = PaperAccount(paper_account_path)
+            account.initialize(paper_capital,
+                fee_rate=os.getenv("TRADINGAGENTS_PAPER_FEE_RATE", "0"),
+                tax_rate=os.getenv("TRADINGAGENTS_PAPER_SELL_TAX_RATE", "0"),
+                slippage=os.getenv("TRADINGAGENTS_PAPER_SLIPPAGE_RATE", "0"))
+            try:
+                prices = await fetch_quotes([plan.symbol])
+            except Exception:
+                prices = {}
+            checkpoint("paper-fill")
+            simulation = account.fill(plan, prices.get(plan.symbol), experience_run_id or payload["clientOrderId"])
+        if simulation is None:
+            checkpoint("paper-record")
+        paper = record_paper_trade(plan, payload, log_path=paper_trade_log,
+            experience_run_id=experience_run_id, simulation=simulation)
         return {
             "executed": False,
             "recorded": True,
@@ -172,6 +198,7 @@ async def execute_plan(
             "plan": plan.__dict__,
             "payload": payload,
             "paperTrade": paper,
+            "paperExecution": simulation,
         }
 
     client_id = os.environ.get("TOSS_CLIENT_ID")
@@ -196,10 +223,14 @@ async def execute_plan(
             os.fsync(handle.fileno())
         return entry
 
+    checkpoint("order-submitting")
     record("SUBMITTING")
     try:
         async with TossClient(client_id, client_secret, account_seq=account_seq, timeout=timeout) as client:
             result = await client.create_order(payload)
+    except RunStopped:
+        record("CANCELLED_BEFORE_SUBMIT")
+        raise
     except Exception as exc:
         # A lost response does not prove rejection. Leave the client order ID
         # available for reconciliation rather than automatically sending again.

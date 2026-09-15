@@ -38,6 +38,7 @@ from tradingagents.llm_clients.timeout_wrapper import HardTimeoutLLM
 from tradingagents.llm_clients.experience_wrapper import ExperienceLLM
 from tradingagents.llm_clients.routing import DEEP_AGENTS
 from tradingagents.reporting import write_report_tree
+from tradingagents.monitoring.control import cancellation_callbacks
 
 from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
 from .conditional_logic import ConditionalLogic
@@ -539,7 +540,7 @@ class TradingAgentsGraph:
             past_context=past_context,
             instrument_context=instrument_context,
         )
-        args = self.propagator.get_graph_args()
+        args = self.propagator.get_graph_args(callbacks=cancellation_callbacks())
 
         # Inject thread_id so same ticker+date+graph-shape resumes; a different
         # date or graph shape starts fresh (#1089).

@@ -1,11 +1,61 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import json
 import subprocess
 from datetime import datetime
 from decimal import Decimal
 
 import main
+import pytest
+
+
+def test_latest_analyses_show_saved_names_and_ticker_matched_fallback():
+    page = main.render_monitor_html({
+        "latestCandidates": {"candidates": [
+            {"ticker": "000660", "name": "SK하이닉스"},
+            {"ticker": "005930", "name": "다른 이름"},
+        ]},
+        "latestSummary": {"analyses": [
+            {"ticker": "005930", "name": "삼성전자", "candidateRank": 1},
+            {"ticker": "000660", "candidateRank": 2},
+            {"ticker": "999999", "candidateRank": 1},
+            {"ticker": "123456", "name": "<script>alert(1)</script>"},
+        ]},
+    })
+    section = page.split('<section data-live="analyses">', 1)[1].split('</section>', 1)[0]
+    assert '<th>Ticker</th><th>종목명</th><th>Rank</th>' in section
+    assert '<td>005930</td><td>삼성전자</td><td>1</td>' in section
+    assert '<td>000660</td><td>SK하이닉스</td><td>2</td>' in section
+    assert '<td>999999</td><td>-</td>' in section
+    assert '&lt;script&gt;alert(1)&lt;/script&gt;' in section
+    assert '<script>' not in section
+
+
+def test_latest_analyses_empty_row_spans_name_column():
+    page = main.render_monitor_html({})
+    assert '<td colspan="7">No analysis yet</td>' in page
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_auto_trading_persists_candidate_name_even_on_error(monkeypatch, tmp_path, fails):
+    monkeypatch.setattr(main, "LOCAL_DIR", tmp_path)
+    monkeypatch.setattr(main, "collect_candidate_snapshot", lambda args: {
+        "candidates": [{"ticker": "005930", "name": "삼성전자"}],
+    })
+
+    async def analyze(args, *, execute):
+        if fails:
+            raise RuntimeError("analysis failed")
+        return {"ticker": args.korea_ticker, "ok": True}
+
+    monkeypatch.setattr(main, "run_korea_toss", analyze)
+    args = main.make_parser().parse_args(["--run-mode", "once", "--date", "2026-09-15"])
+    result = asyncio.run(main.run_auto_trading(args, execute=False))
+    saved = json.loads(main.Path(result["summaryPath"]).read_text())
+    assert saved["analyses"][0]["name"] == "삼성전자"
+    assert saved["analyses"][0]["ok"] is not fails
 
 
 def test_order_budget_defaults_to_ten_percent_of_paper_capital():
@@ -69,7 +119,8 @@ def test_make_config_forwards_llm_timeout():
     assert config["llm_timeout"] == "180"
     assert config["llm_provider"] == "openai"
     assert config["trading_objective"]["capital_krw"] == "10000000"
-    assert config["trading_objective"]["daily_target_profit_krw"] == "100000"
+    assert config["trading_objective"]["position_target_return"] == "0.01"
+    assert "daily_target_profit_krw" not in config["trading_objective"]
 
 
 def test_regular_market_hours_are_korea_weekday_only():

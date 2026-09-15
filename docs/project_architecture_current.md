@@ -3,6 +3,9 @@
 작성 기준: 2026-09-10 현재 로컬 프로젝트 상태
 범위: 기존 TradingAgents 구조 + 공용 `.env` + 한국 종목/Naver 뉴스 + Toss API 주문 dry-run/실주문 연동
 
+2026-09-15 운영 기준 업데이트: [최종 반영 요약](implementation_summary_2026-09-15.md)과
+[종목별 단타 전략](intraday_strategy.md)을 우선 참고하세요. 아래 상세 구조에는 이전 구현 설명도 포함됩니다.
+
 ## 1. 프로젝트 목표
 
 TradingAgents는 여러 LLM agent가 금융 데이터를 수집하고 토론하여 최종 투자 판단을 생성하는 multi-agent trading framework입니다.
@@ -13,18 +16,19 @@ TradingAgents는 여러 LLM agent가 금융 데이터를 수집하고 토론하�
 - Naver Search API를 TradingAgents 내부 독립 news vendor로 사용
 - 공용 `/Users/leejang2/Project/.env`에서 OpenAI, Naver, Toss API 키를 읽음
 - 기본 운용 목표를 자본금 10,000,000원 기준 한국 종목 당일 단타 모의투자로 설정
-- 일 목표 수익률은 1%, 즉 일 목표 수익금 100,000원으로 설정
+- 종목별 실제 평균 매입가 대비 +1% 익절로 설정(비용 전). 계좌 하루 1% 목표는 폐기
 - 종목당 기본 진입 예산은 자본금의 10%, 즉 1,000,000원으로 설정
-- `main.py` 기본 실행은 한국 정규장 09:00-15:30, 월-금 기준으로 매일 1회 모의투자를 수행
+- `main.py` 기본 실행은 한국 정규장 09:00-15:30 중 보유 점검, 09:20과 13시에 각각 1회 후보 분석·매매 기준 검사를 수행
 - `Start-Live.command`는 동일한 후보 선정/단타 목표/정규장 스케줄을 `auto-live --yes`로 실행하며 주문 전송 단계만 Toss 실주문으로 전환
-- `main.py --monitor --monitor-host tailscale` 실행 시 Tailscale에 로그인된 외부 모바일 데이터 기기의 웹브라우저에서 모의투자 상태 확인 및 토큰 기반 매매 기준 설정
+- `main.py --monitor --monitor-host tailscale` 실행 시 외부 모바일 데이터 기기에서 Tailscale과 웹 ID·비밀번호 로그인 후 상태·계좌 조회, 매매 기준 설정 및 수동 실행 가능. 등록·중단/대기 제어는 [웹 로그인·수동 실행 안내](web_login_and_manual_runs.md) 참고
 - 최종 Portfolio Manager 판단을 Toss 주문 계획으로 변환
-- 기본은 `dry-run` 주문 의도 기록(`RECORDED`, 체결 미검증). 자동 실전은 `--scenario auto-live --yes`, 지정 종목 단발 실전은 `--scenario korea-execute --yes`로 실행
-- 웹 LLM 설정에서 OpenAI 전체, Ollama 전체, 역할별 혼합 선택. 혼합 기본값은 뉴스만 로컬이며 나머지는 OpenAI
+- 당일 `main.py` 기본은 가상 잔고 기반 dry-run 체결. 레거시 `RECORDED`는 체결로 취급하지 않음. 자동 실전은 `--scenario auto-live --yes`, 지정 종목 단발 실전은 `--scenario korea-execute --yes`로 실행
+- 기본 LLM 제공자는 역할별 혼합. 웹에서 OpenAI 전체, Ollama 전체, 역할별 혼합 선택 가능. 혼합 기본값은 뉴스만 로컬이며 나머지는 OpenAI
 
 최신 검토 결과와 설정 방법은 [2026-09-10 검토 보고서](review_and_llm_settings_2026-09-10.md)를 참조합니다.
-현재 dry-run은 체결가, 현금 잔고, 보유 수량 및 실현손익을 관리하지 않습니다.
-따라서 자본금/일 수익률은 분석 목표이며, 실제 모의계좌 수익률 측정이나 당일 자동 청산을 보장하지 않습니다.
+현재 main.py 당일 dry-run에는 가상 체결가, 현금, 보유 수량 및 실현손익 장부와 기간별 평가 수익률이 있습니다.
+[계좌·수익률 안내](account_dashboard.md)에 계산 기준과 실제 Toss API 지원 범위를 정리했습니다.
+종목별 익절·손절·보유기한 청산을 시도하지만 실제 체결이나 목표 수익 달성을 보장하지 않습니다.
 
 ## 2. 실행 환경
 

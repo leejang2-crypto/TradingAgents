@@ -10,12 +10,13 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 import subprocess
 import sys
 import threading
 import tempfile
 from copy import deepcopy
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -31,6 +32,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
 
 from tradingagents.brokers.toss_executor import execute_plan, plan_from_decision
+from tradingagents.brokers.account_service import account_view, refresh_account
 from tradingagents.agents.utils.experience import ExperienceStore
 from tradingagents.dataflows.naver_news import (
     collect_candidate_news_naver,
@@ -41,6 +43,10 @@ from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.dataflows.utils import safe_ticker_component
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.llm_clients.routing import AGENT_LABELS, DEEP_AGENTS, LLM_DEFAULTS, NEWS_ONLY_ROUTING, describe_routing
+from tradingagents.monitoring.auth import DashboardAuth, LoginError
+from tradingagents.monitoring.control import BusyError, RunController, RunStopped, checkpoint, scheduled_job
+from tradingagents.brokers.position_risk import PositionRiskManager, RISK_DEFAULTS
+from tradingagents.brokers.intraday import INTRADAY_DEFAULTS, DECIMAL_LIMITS, INTEGER_LIMITS
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -52,6 +58,8 @@ DEFAULT_TRADING_STYLE = "intraday-scalping"
 KOREA_TZ = ZoneInfo("Asia/Seoul")
 DEFAULT_MARKET_OPEN = "09:00"
 DEFAULT_MARKET_CLOSE = "15:30"
+AFTERNOON_RUN_TIME = "13:00"
+TRADING_SLOTS = {"morning", "afternoon"}
 DEFAULT_MONITOR_HOST = "127.0.0.1"
 DEFAULT_MONITOR_PORT = 8765
 AUTO_SCENARIOS = {"auto-paper", "auto-live"}
@@ -72,6 +80,8 @@ SETTING_KEYS = {
     "holiday_dates",
     "llm_timeout",
     *LLM_DEFAULTS,
+    *RISK_DEFAULTS,
+    *INTRADAY_DEFAULTS,
 }
 
 
@@ -105,7 +115,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--provider",
         choices=["openai", "ollama", "hybrid"],
-        default="openai",
+        default=LLM_DEFAULTS["provider"],
         help=(
             "LLM provider. hybrid defaults to local news analysis and OpenAI for other roles."
         ),
@@ -134,7 +144,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--daily-target-return",
         default=DEFAULT_DAILY_TARGET_RETURN,
-        help="Daily trading target return. Default: 0.01, i.e. 1%%.",
+        help="Deprecated compatibility option; no longer triggers account-wide profit liquidation. Use --position-target-return.",
     )
     parser.add_argument(
         "--trading-style",
@@ -162,7 +172,7 @@ def make_parser() -> argparse.ArgumentParser:
         default="daily-market",
         help=(
             "Automatic trading run mode. daily-market keeps main.py alive and runs "
-            "once per Korean regular session; once runs immediately and exits."
+            "at market open and 13:00 Korea time; once runs immediately and exits."
         ),
     )
     parser.add_argument(
@@ -194,7 +204,7 @@ def make_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=os.environ.get("TRADINGAGENTS_MONITOR", "").strip().lower()
         in {"1", "true", "yes", "on"},
-        help="Start a web dashboard for status, paper-trading artifacts, and token-protected settings.",
+        help="Start a login-protected dashboard for status, accounts, settings, and manual runs.",
     )
     parser.add_argument(
         "--monitor-host",
@@ -215,6 +225,11 @@ def make_parser() -> argparse.ArgumentParser:
         default="180",
         help="Per-request LLM timeout in seconds for automated runs. Default: 180.",
     )
+    for key, value in RISK_DEFAULTS.items():
+        parser.add_argument("--" + key.replace("_", "-"), type=int, default=value)
+    for key, value in INTRADAY_DEFAULTS.items():
+        parser.add_argument("--" + key.replace("_", "-"), type=int if key in INTEGER_LIMITS else str, default=value,
+                            **({"choices": ["breakout", "pullback"]} if key == "entry_strategy" else {}))
     parser.add_argument(
         "--skip-news-collection",
         action="store_true",
@@ -361,45 +376,103 @@ def load_scheduler_state(scenario: str = "auto-paper") -> dict[str, Any]:
         state = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(state, dict) or not isinstance(state.get("completedDates"), list):
             raise ValueError("Invalid scheduler state")
+        runs = state.setdefault("runs", {})
+        if not isinstance(runs, dict):
+            raise ValueError("Invalid scheduler runs")
+        # Migrate the old once-a-day ledger without replaying a prior order.
+        # Unknown legacy timestamps conservatively reserve both slots.
+        for run_date in set(runs) | set(state["completedDates"]):
+            record = runs.setdefault(run_date, {"status": "completed"})
+            if not isinstance(record, dict):
+                raise ValueError("Invalid scheduler run")
+            if "slots" not in record:
+                slots = TRADING_SLOTS
+                stamp = record.get("startedAt") or record.get("completedAt")
+                if stamp:
+                    try:
+                        parsed = datetime.fromisoformat(stamp)
+                        if parsed.tzinfo is None:
+                            parsed = parsed.replace(tzinfo=KOREA_TZ)
+                        slots = {active_trading_slot(parsed)}
+                    except (TypeError, ValueError):
+                        pass
+                record["slots"] = {slot: dict(record) for slot in slots}
+            if not isinstance(record["slots"], dict) or any(
+                slot not in TRADING_SLOTS or not isinstance(value, dict) or not isinstance(value.get("status"), str)
+                for slot, value in record["slots"].items()
+            ):
+                raise ValueError("Invalid scheduler slots")
         return state
     except (OSError, ValueError) as exc:
         # Do not silently forget completed days and repeat orders after corruption.
         raise ValueError(f"Cannot read scheduler state: {path}") from exc
 
 
-def mark_scheduler_completed(run_date: str, summary_path: str | None, status: str = "completed", *, scenario: str = "auto-paper") -> None:
+def mark_scheduler_completed(run_date: str, summary_path: str | None, status: str = "completed", *, scenario: str = "auto-paper", slot: str = "morning") -> None:
+    if slot not in TRADING_SLOTS:
+        raise ValueError("Invalid trading slot")
     path = scheduler_state_path(scenario)
     state = load_scheduler_state(scenario)
     completed = set(state.get("completedDates", []))
     completed.add(run_date)
     state["completedDates"] = sorted(completed)
-    state.setdefault("runs", {})[run_date] = {
-        **state.get("runs", {}).get(run_date, {}),
+    record = state.setdefault("runs", {}).setdefault(run_date, {"slots": {}})
+    completed_run = {
+        **record["slots"].get(slot, {}),
         "completedAt": datetime.now(KOREA_TZ).isoformat(timespec="seconds"),
         "summaryPath": summary_path,
         "status": status,
     }
+    record["slots"][slot] = completed_run
+    record.update(completed_run)
+    record["lastSlot"] = slot
     atomic_write_json(path, state)
 
 
-def has_scheduler_completed(run_date: str, scenario: str = "auto-paper") -> bool:
+def has_scheduler_completed(run_date: str, scenario: str = "auto-paper", slot: str | None = None) -> bool:
     state = load_scheduler_state(scenario)
-    return run_date in set(state.get("completedDates", [])) or (
-        scenario == "auto-live" and run_date in state.get("runs", {})
-    )
+    slots = state.get("runs", {}).get(run_date, {}).get("slots", {})
+    # A reserved slot is not replayed, including after interruption or error.
+    return bool(slots) if slot is None else slot in slots
 
 
-def mark_live_run_started(run_date: str) -> None:
-    state = load_scheduler_state("auto-live")
-    state.setdefault("runs", {})[run_date] = {
+def mark_run_started(run_date: str, scenario: str, slot: str) -> None:
+    if slot not in TRADING_SLOTS:
+        raise ValueError("Invalid trading slot")
+    state = load_scheduler_state(scenario)
+    record = state.setdefault("runs", {}).setdefault(run_date, {"slots": {}})
+    if slot in record["slots"]:
+        raise RuntimeError("This trading slot was already started; automatic replay is disabled.")
+    started = {
         "status": "started", "startedAt": datetime.now(KOREA_TZ).isoformat(timespec="seconds"),
     }
+    record["slots"][slot] = started
+    record.update(started)
+    record["lastSlot"] = slot
     # Persist before any broker call. An interrupted run is not replayed on restart.
-    atomic_write_json(scheduler_state_path("auto-live"), state)
+    atomic_write_json(scheduler_state_path(scenario), state)
+
+
+def mark_live_run_started(run_date: str, slot: str = "morning") -> None:
+    mark_run_started(run_date, "auto-live", slot)
+
+
+def active_trading_slot(now: datetime) -> str:
+    return "afternoon" if now.astimezone(KOREA_TZ).time() >= parse_hhmm(AFTERNOON_RUN_TIME) else "morning"
+
+
+def next_trading_slot_time(now: datetime, args: argparse.Namespace, holidays: set[date]) -> datetime:
+    afternoon = datetime.combine(now.date(), parse_hhmm(AFTERNOON_RUN_TIME), tzinfo=KOREA_TZ)
+    if now < afternoon and parse_hhmm(AFTERNOON_RUN_TIME) < parse_hhmm(args.market_close):
+        return afternoon
+    tomorrow = datetime.combine(now.date() + timedelta(days=1), time.min, tzinfo=KOREA_TZ)
+    return next_regular_market_open(tomorrow, open_text=args.market_open, close_text=args.market_close, holidays=holidays)
 
 
 def default_settings(args: argparse.Namespace) -> dict[str, Any]:
     return {
+        **{key: getattr(args, key, value) for key, value in RISK_DEFAULTS.items()},
+        **{key: getattr(args, key, value) for key, value in INTRADAY_DEFAULTS.items()},
         **{key: deepcopy(getattr(args, key, value)) for key, value in LLM_DEFAULTS.items()},
         "paper_capital": args.paper_capital,
         "position_pct": args.position_pct,
@@ -482,6 +555,28 @@ def validate_trading_settings(settings: dict[str, Any]) -> dict[str, Any]:
             if numeric > 3600:
                 raise ValueError("llm_timeout must be 3600 seconds or less.")
             cleaned[key] = str(numeric)
+        elif key in DECIMAL_LIMITS:
+            if isinstance(value, bool):
+                raise ValueError(f"{key} must be numeric.")
+            try:
+                numeric = Decimal(str(value))
+            except InvalidOperation as exc:
+                raise ValueError(f"{key} must be numeric.") from exc
+            low, high = map(Decimal, DECIMAL_LIMITS[key])
+            if not numeric.is_finite() or not low <= numeric <= high:
+                raise ValueError(f"{key} must be between {low} and {high}.")
+            cleaned[key] = str(numeric)
+        elif key == "entry_strategy":
+            if value not in {"breakout", "pullback"}:
+                raise ValueError("entry_strategy must be breakout or pullback.")
+            cleaned[key] = value
+        elif key in RISK_DEFAULTS or key in INTEGER_LIMITS:
+            if isinstance(value, bool) or not re.fullmatch(r"[0-9]+", str(value)):
+                raise ValueError(f"{key} must be a whole number.")
+            limits = INTEGER_LIMITS.get(key, (10, 300) if key == "position_check_seconds" else (5, 120))
+            if not limits[0] <= int(value) <= limits[1]:
+                raise ValueError(f"{key} must be between {limits[0]} and {limits[1]}.")
+            cleaned[key] = int(value)
         elif key == "provider":
             if not isinstance(value, str) or value not in {"openai", "ollama", "hybrid"}:
                 raise ValueError("provider must be openai, ollama, or hybrid.")
@@ -507,6 +602,8 @@ def validate_trading_settings(settings: dict[str, Any]) -> dict[str, Any]:
         open_text = str(cleaned.get("market_open", DEFAULT_MARKET_OPEN))
         close_text = str(cleaned.get("market_close", DEFAULT_MARKET_CLOSE))
         market_window_for(today_korea(), open_text, close_text)
+    if cleaned.get("buy_cutoff_minutes", 30) < cleaned.get("liquidation_minutes", 15):
+        raise ValueError("신규 매수 중단은 청산 시작보다 늦을 수 없습니다.")
     return cleaned
 
 
@@ -640,7 +737,8 @@ def build_monitor_snapshot() -> dict[str, Any]:
         "scheduler": read_json_file(scheduler_state_path(scenario)) or {"completedDates": []},
         "settings": {**deepcopy(LLM_DEFAULTS), **load_trading_settings()},
         "settingsPath": str(settings_path()),
-        "settingsRequireToken": True,
+        "settingsRequireToken": False,
+        "authentication": "login-session",
         "latestSummaryPath": str(latest_summary_path) if latest_summary_path else None,
         "latestSummary": latest_summary,
         "latestCandidatePath": str(latest_candidate_path) if latest_candidate_path else None,
@@ -661,7 +759,7 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
     summary = snapshot.get("latestSummary") if isinstance(snapshot.get("latestSummary"), dict) else {}
     candidates = snapshot.get("latestCandidates") if isinstance(snapshot.get("latestCandidates"), dict) else {}
     settings = snapshot.get("settings") if isinstance(snapshot.get("settings"), dict) else {}
-    settings = {**LLM_DEFAULTS, **settings}
+    settings = {**LLM_DEFAULTS, **INTRADAY_DEFAULTS, **settings}
 
     def options(values: dict[str, str], selected: str) -> str:
         return "".join(f'<option value="{_compact_text(value)}"{" selected" if value == selected else ""}>{_compact_text(label)}</option>' for value, label in values.items())
@@ -675,6 +773,24 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
     model_controls = "".join(
         f'<label>{label}<input name="{name}" list="{"ollama-models" if name.startswith("ollama") else "openai-models"}" required value="{_compact_text(settings[name])}"></label>'
         for name, label in {"openai_quick_model": "OpenAI quick 모델", "openai_deep_model": "OpenAI deep 모델", "ollama_quick_model": "Ollama quick 모델", "ollama_deep_model": "Ollama deep 모델"}.items()
+    )
+    intraday_controls = "".join(
+        f'<label>{label}<input name="{key}" type="number" min="{DECIMAL_LIMITS.get(key, INTEGER_LIMITS.get(key))[0]}" max="{DECIMAL_LIMITS.get(key, INTEGER_LIMITS.get(key))[1]}" step="{"1" if key in INTEGER_LIMITS else "any"}" value="{_compact_text(settings[key])}" required></label>'
+        for key, label in {
+            "position_target_return": "종목 익절 비율 (0.01 = 1%)",
+            "position_stop_loss": "종목 최대 손절 비율 (0.005 = 0.5%)",
+            "daily_loss_limit": "일일 손실 한도 (자본 대비 비율)",
+            "trade_risk_fraction": "1회 매매 위험 한도 (자본 대비 비율)",
+            "estimated_cost_rate": "왕복 비용 추정 비율",
+            "min_reward_risk": "최소 비용 반영 손익비",
+            "min_relative_volume": "최소 상대 거래량 (배)",
+            "min_session_turnover": "최소 당일 추정 거래대금 (원)",
+            "max_spread": "최대 호가 스프레드 비율",
+            "market_drop_limit": "지수 장초 대비 하락 제한 비율",
+            "max_entry_extension": "분봉 신호 대비 가격 이탈 한도",
+            "stagnation_minutes": "정체 종목 청산 시간 (분)",
+            "max_consecutive_stops": "일일 연속 손절 제한 (회)",
+        }.items()
     )
     candidate_rows = []
     for row in (candidates.get("candidates") or [])[:10]:
@@ -699,9 +815,14 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
             f"<td>{_compact_text(plan.get('action'))}</td>"
             f"<td>{_compact_text(plan.get('order_amount') or plan.get('quantity'))}</td>"
             f"<td>{_compact_text(plan.get('rating'))}</td>"
-            f"<td>{_compact_text(trade.get('status'))}{' (체결 미검증)' if not trade.get('fillVerified') else ''}</td>"
+            f"<td>{_compact_text(trade.get('status'))}{' (가상 체결)' if trade.get('status') == 'SIMULATED_FILLED' else ' (체결 미검증)' if not trade.get('fillVerified') else ''}</td>"
             "</tr>"
         )
+    candidate_names = {
+        row["ticker"]: row.get("name")
+        for row in (candidates.get("candidates") or [])
+        if row.get("ticker")
+    }
     analysis_rows = []
     for analysis in (summary.get("analyses") or []):
         toss = analysis.get("toss") or {}
@@ -709,9 +830,13 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
         order_label = str(plan.get("action") or "-")
         if toss.get("skipped"):
             order_label += " (미기록: " + str(toss["skipped"]) + ")"
+        simulation = toss.get("paperExecution")
+        if simulation:
+            order_label += " · " + simulation["status"] + (" · " + simulation["reason"] if simulation.get("reason") else "")
         analysis_rows.append(
             "<tr>"
             f"<td>{_compact_text(analysis.get('ticker'))}</td>"
+            f"<td>{_compact_text(analysis.get('name') or candidate_names.get(analysis.get('ticker')))}</td>"
             f"<td>{_compact_text(analysis.get('candidateRank'))}</td>"
             f"<td>{_compact_text(analysis.get('error') or analysis.get('decision'))}</td>"
             f"<td>{_compact_text(order_label)}</td>"
@@ -725,6 +850,11 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>TradingAgents Monitor</title>
+  <link rel="stylesheet" href="/assets/account.css">
+  <link rel="stylesheet" href="/assets/control.css">
+  <script src="/assets/account.js" defer></script>
+  <script src="/assets/control.js" defer></script>
+  <script src="/assets/positions.js" defer></script>
   <style>
     :root {{ color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
     body {{ margin: 0; background: #f7f8fa; color: #1d2433; }}
@@ -760,9 +890,7 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
       const form = event.currentTarget;
       const button = form.querySelector('button[type="submit"]');
       const message = document.getElementById("settings-message");
-      const token = document.getElementById("settings-token").value;
       const payload = Object.fromEntries(new FormData(form).entries());
-      delete payload.monitor_token;
       payload.hybrid_agent_providers = {{}};
       for (const key of Object.keys(payload)) {{
         if (key.startsWith("route_")) {{
@@ -777,7 +905,7 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
           method: "POST",
           headers: {{
             "Content-Type": "application/json",
-            "X-Monitor-Token": token
+            "X-Requested-With": "TradingAgents"
           }},
           body: JSON.stringify(payload)
         }});
@@ -817,6 +945,7 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
       try {{
         const response = await fetch("/", {{cache: "no-store"}});
         if (!response.ok) throw new Error();
+        if (response.redirected && new URL(response.url).pathname === "/login") {{ location.assign("/login"); return; }}
         const fresh = new DOMParser().parseFromString(await response.text(), "text/html");
         document.querySelectorAll("[data-live]").forEach(panel => {{
           const replacement = fresh.querySelector('[data-live="' + panel.dataset.live + '"]');
@@ -833,34 +962,107 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
     <h1>TradingAgents Monitor</h1>
     <div data-live="timestamp">Asia/Seoul {_compact_text(snapshot.get("now"))}</div>
     <div id="connection-status" role="status">연결됨</div>
+    <button id="logout" type="button">로그아웃</button>
   </header>
   <main>
+    <section id="manual-panel">
+      <h2>수동 실행</h2>
+      <div class="control-toolbar">
+        <label>종목<input id="manual-ticker" value="005930.KS" maxlength="9" pattern="[0-9]{{6}}\\.(KS|KQ)"></label>
+        <label class="control-check"><input id="auto-paused" type="checkbox">자동 실행 일시정지</label>
+        <strong id="manual-mode">실행기 연결 확인 중</strong>
+      </div>
+      <div class="control-actions">
+        <button type="button" data-action="news" disabled>종목 뉴스 수집</button>
+        <button type="button" data-action="candidates" disabled>후보 종목 선정</button>
+        <button type="button" data-action="analyze" disabled>종목 분석만 실행</button>
+        <button type="button" data-action="trade" disabled>후보 분석 후 매매</button>
+      </div>
+      <dl class="control-status"><dt>현재 작업</dt><dd id="current-job">-</dd><dt>대기 작업</dt><dd id="pending-job">-</dd><dt>최근 결과</dt><dd id="last-job">-</dd></dl>
+      <button id="cancel-pending" type="button" hidden>대기 실행 취소</button>
+      <details id="manual-result" hidden><summary>최근 실행 상세</summary><pre id="manual-result-text"></pre></details>
+      <div id="control-message" class="message" role="status"></div>
+    </section>
+    <dialog id="run-dialog" aria-labelledby="run-dialog-title">
+      <h2 id="run-dialog-title">실행 확인</h2>
+      <p id="run-dialog-message"></p>
+      <p>중단해도 이미 접수된 주문과 체결은 유지됩니다. 새 매매 실행은 추가 주문을 만들 수 있습니다.</p>
+      <div class="control-actions">
+        <button type="button" id="run-stop">중단 후 실행</button>
+        <button type="button" id="run-wait">마무리 후 실행</button>
+        <button type="button" id="run-confirm">실제 주문 실행</button>
+        <button type="button" id="run-dismiss">취소</button>
+      </div>
+    </dialog>
+    <section id="positions-panel">
+      <h2>보유 관리 · 청산</h2>
+      <p id="positions-status" role="status">보유 관리 연결 확인 중</p>
+      <div id="positions-daily"></div>
+      <p class="muted">매수일 포함 최대 2거래일. 자동 분석을 일시정지해도 보유 점검·청산은 계속됩니다.</p>
+      <div class="account-scroll"><table><thead><tr><th>종목</th><th>관리 수량</th><th>평균 매입가</th><th>종목 수익률</th><th>익절가 / 손절가</th><th>매수일</th><th>최종 보유 한도</th><th>다음 거래일까지 이월 허용</th><th>청산 상태</th></tr></thead><tbody id="positions-body"></tbody></table></div>
+      <div id="entry-checks"></div>
+      <p id="positions-warning" role="status"></p>
+      <details id="position-adoption" hidden><summary>기존 실계좌 보유분 편입</summary>
+        <form id="position-adopt-form">
+          <div class="form-grid"><label>종목 코드<input name="symbol" pattern="[A-Z0-9]{{6}}" maxlength="6" placeholder="005930" required></label>
+          <label>실제 최초 매수일<input name="acquiredDate" type="date" max="{today_korea().isoformat()}" required></label></div>
+          <label class="control-check"><input name="confirmed" type="checkbox" required>해당 종목의 현재 보유 전량을 자동 청산 대상으로 편입합니다.</label>
+          <button type="submit">보유분 편입</button>
+          <p id="position-adopt-message" role="status"></p>
+        </form>
+      </details>
+      <h3>최근 주문 체결 확인</h3>
+      <div class="account-scroll"><table><thead><tr><th>종목</th><th>구분</th><th>주문 수량/금액</th><th>누적 체결 수량</th><th>상태</th><th>주문 ID</th></tr></thead><tbody id="position-orders"></tbody></table></div>
+    </section>
     <section data-live="runtime">
       <h2>Runtime</h2>
       <div class="grid">
-        <div class="metric"><div class="label">주문 모드</div><div class="value">{'실투자 · Toss 실제 주문' if live else '모의투자 · 주문 의도 기록'}</div></div>
+        <div class="metric"><div class="label">주문 모드</div><div class="value">{'실투자 · Toss 실제 주문' if live else '모의투자 · 가상 체결 계좌'}</div></div>
         <div class="metric"><div class="label">상태</div><div class="value">{_compact_text(runtime.get("status"))}</div></div>
         <div class="metric"><div class="label">업데이트</div><div class="value">{_compact_text(runtime.get("updatedAt"))}</div></div>
         <div class="metric"><div class="label">다음 실행</div><div class="value">{_compact_text(runtime.get("nextRunAfter"))}</div></div>
         <div class="metric"><div class="label">오늘 실행일</div><div class="value">{_compact_text(runtime.get("date") or summary.get("date"))}</div></div>
       </div>
     </section>
+    <section id="account-panel">
+      <h2>계좌 · 수익률</h2>
+      <div class="account-toolbar">
+        <fieldset><legend>계좌</legend><div class="account-options">
+          <label><input type="radio" name="account_mode" value="dry-run"{' checked' if not live else ''}>모의투자</label>
+          <label><input type="radio" name="account_mode" value="live"{' checked' if live else ''}>실투자</label>
+        </div></fieldset>
+        <fieldset><legend>수익률 단위</legend><div class="account-options">
+          <label><input type="radio" name="return_period" value="day" checked>일</label>
+          <label><input type="radio" name="return_period" value="week">주</label>
+          <label><input type="radio" name="return_period" value="month">월</label>
+          <label><input type="radio" name="return_period" value="year">년</label>
+        </div></fieldset>
+        <label>수익률 조회 기준일<input id="account-date" type="date" value="{today_korea().isoformat()}"></label>
+        <button id="account-load" type="button">조회</button>
+        <button id="account-refresh" type="button">최신 자료 조회</button>
+      </div>
+      <div id="account-message" class="message" role="status"></div>
+      <div id="account-results" hidden>
+        <p id="account-source"></p>
+        <div id="account-metrics" class="grid"></div>
+        <p id="account-note"></p>
+        <h3 id="returns-title">기간별 수익률</h3><div id="account-returns" class="account-scroll"></div>
+        <h3>보유주식</h3><div id="account-holdings" class="account-scroll"></div>
+        <h3>최근 주문 · 체결</h3><div id="account-orders" class="account-scroll"></div>
+      </div>
+    </section>
     <section data-live="objective">
       <h2>Objective</h2>
       <div class="grid">
         <div class="metric"><div class="label">자본금</div><div class="value">{_compact_text(settings.get("paper_capital") or summary.get("paperCapital"))} KRW</div></div>
-        <div class="metric"><div class="label">일 목표 수익률</div><div class="value">{_compact_text(settings.get("daily_target_return") or summary.get("dailyTargetReturn"))}</div></div>
+        <div class="metric"><div class="label">종목별 익절 목표</div><div class="value">{Decimal(settings['position_target_return']) * 100:.2f}%</div></div>
         <div class="metric"><div class="label">종목당 비중</div><div class="value">{_compact_text(settings.get("position_pct") or summary.get("positionPct"))}</div></div>
         <div class="metric"><div class="label">운영 모드</div><div class="value">{_compact_text(summary.get("runMode"))}</div></div>
       </div>
     </section>
     <section>
       <h2>Trading Settings</h2>
-      <p class="muted">설정 저장에는 터미널에 출력된 모니터 토큰이 필요합니다. 저장된 값은 다음 자동 실행부터 적용됩니다.</p>
       <form onsubmit="saveSettings(event)">
-        <label>모니터 토큰
-          <input id="settings-token" name="monitor_token" type="password" autocomplete="current-password" placeholder="터미널의 settings token 입력">
-        </label>
         <h3>LLM 설정</h3>
         <div class="form-grid">
           <label>실행 제공자<select name="provider" onchange="updateProvider()">{options({"openai": "OpenAI 전체", "ollama": "Ollama 전체", "hybrid": "역할별 혼합"}, settings["provider"])}</select></label>
@@ -877,7 +1079,6 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
         <div class="form-grid">
           <label>자본금 KRW<input name="paper_capital" inputmode="numeric" value="{_compact_text(settings.get("paper_capital", DEFAULT_PAPER_CAPITAL))}"></label>
           <label>종목당 비중<input name="position_pct" inputmode="decimal" value="{_compact_text(settings.get("position_pct", DEFAULT_POSITION_PCT))}"></label>
-          <label>일 목표 수익률<input name="daily_target_return" inputmode="decimal" value="{_compact_text(settings.get("daily_target_return", DEFAULT_DAILY_TARGET_RETURN))}"></label>
           <label>전략 스타일<input name="trading_style" value="{_compact_text(settings.get("trading_style", DEFAULT_TRADING_STYLE))}"></label>
         </div>
         <h3>후보 선정</h3>
@@ -893,7 +1094,17 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
         <label>추가 검색 키워드
           <textarea name="extra_queries">{_compact_text(settings.get("extra_queries", ""), "")}</textarea>
         </label>
+        <h3>단타 매매 기준</h3>
+        <div class="form-grid">
+          <label>분봉 진입 전략<select name="entry_strategy">{options({'breakout': '15분 고점 돌파', 'pullback': 'VWAP 눌림목 회복'}, settings['entry_strategy'])}</select></label>
+          {intraday_controls}
+        </div>
         <h3>운영 시간</h3>
+        <div class="form-grid">
+          <label>보유 점검 주기 (초)<input name="position_check_seconds" type="number" min="10" max="300" value="{settings.get('position_check_seconds', 30)}"></label>
+          <label>장 종료 전 청산 시작 (분)<input name="liquidation_minutes" type="number" min="5" max="120" value="{settings.get('liquidation_minutes', 15)}"></label>
+          <label>장 종료 전 신규 매수 중단 (분)<input name="buy_cutoff_minutes" type="number" min="5" max="120" value="{settings.get('buy_cutoff_minutes', 30)}"></label>
+        </div>
         <div class="form-grid">
           <label>장 시작<input name="market_open" value="{_compact_text(settings.get("market_open", DEFAULT_MARKET_OPEN))}"></label>
           <label>장 종료<input name="market_close" value="{_compact_text(settings.get("market_close", DEFAULT_MARKET_CLOSE))}"></label>
@@ -909,8 +1120,8 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
     </section>
     <section data-live="analyses">
       <h2>Latest Analyses</h2>
-      <table><thead><tr><th>Ticker</th><th>Rank</th><th>Decision / Error</th><th>Order</th><th>Report</th><th>사용 LLM</th></tr></thead>
-      <tbody>{''.join(analysis_rows) or '<tr><td colspan="6">No analysis yet</td></tr>'}</tbody></table>
+      <table><thead><tr><th>Ticker</th><th>종목명</th><th>Rank</th><th>Decision / Error</th><th>Order</th><th>Report</th><th>사용 LLM</th></tr></thead>
+      <tbody>{''.join(analysis_rows) or '<tr><td colspan="7">No analysis yet</td></tr>'}</tbody></table>
       <p><code>{_compact_text(snapshot.get("latestSummaryPath"))}</code></p>
     </section>
     <section data-live="candidates">
@@ -935,23 +1146,89 @@ class MonitorHandler(BaseHTTPRequestHandler):
         super().setup()
         self.connection.settimeout(10)
 
-    def _send_json(self, status_code: int, payload: dict[str, Any]) -> None:
+    def end_headers(self):
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", "frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'")
+        super().end_headers()
+
+    def _authorized(self):
+        auth = getattr(self.server, "auth", None)
+        return (isinstance(auth, DashboardAuth) and auth.authorized(self.headers)) or is_authorized_monitor_request(self.headers)
+
+    def _browser_write_allowed(self):
+        # Explicit API bearer credentials remain compatible; cookies need same-origin JS.
+        if is_authorized_monitor_request(self.headers):
+            return True
+        origin = self.headers.get("Origin")
+        return (self.headers.get("X-Requested-With") == "TradingAgents" and
+                self.headers.get("Sec-Fetch-Site", "same-origin") in {"same-origin", "none"} and
+                (not origin or (urlparse(origin).scheme in {"http", "https"} and
+                                urlparse(origin).netloc == self.headers.get("Host"))))
+
+    def _send_json(self, status_code: int, payload: dict[str, Any], *, cookie=None) -> None:
         encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(encoded)))
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
         self.end_headers()
         self.wfile.write(encoded)
 
     def do_GET(self) -> None:
         try:
             self._get()
-        except (ValueError, OSError) as exc:
+        except (ValueError, OSError, sqlite3.Error) as exc:
             self._send_json(503, {"ok": False, "error": str(exc)})
 
     def _get(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path in {"/assets/account.js", "/assets/account.css", "/assets/control.js", "/assets/control.css", "/assets/login.js", "/assets/positions.js"}:
+            name = parsed.path.rsplit("/", 1)[-1]
+            payload = (PROJECT_DIR / "tradingagents" / "monitoring" / name).read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/javascript; charset=utf-8" if name.endswith(".js") else "text/css; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if parsed.path == "/login":
+            payload = (PROJECT_DIR / "tradingagents/monitoring/login.html").read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if not self._authorized():
+            if parsed.path in {"/", "/index.html"}:
+                self.send_response(303)
+                self.send_header("Location", "/login")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            else:
+                self._send_json(401, {"ok": False, "error": "로그인이 필요합니다."})
+            return
+        if parsed.path == "/api/control":
+            control = getattr(self.server, "control", None)
+            self._send_json(200, control.snapshot() if isinstance(control, RunController) else {"available": False})
+            return
+        if parsed.path == "/api/positions":
+            risk = getattr(self.server, "risk", None)
+            self._send_json(200, risk.snapshot() if isinstance(risk, PositionRiskManager) else {"enabled": False})
+            return
+        if parsed.path == "/api/account":
+            query = parse_qs(parsed.query)
+            self._send_json(200, account_view(LOCAL_DIR,
+                query.get("mode", ["dry-run"])[0], query.get("period", ["day"])[0],
+                query.get("through", [None])[0], load_trading_settings().get("paper_capital", DEFAULT_PAPER_CAPITAL)))
+            return
         if parsed.path == "/api/llm-models":
             base_url = parse_qs(parsed.query).get("base_url", [LLM_DEFAULTS["ollama_base_url"]])[0]
             try:
@@ -981,12 +1258,21 @@ class MonitorHandler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self) -> None:
+        try:
+            self._post()
+        except (ValueError, OSError, sqlite3.Error):
+            self._send_json(503, {"ok": False, "error": "서버의 인증 또는 저장 파일을 확인하세요."})
+
+    def _post(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path != "/api/settings":
+        if parsed.path not in {"/api/settings", "/api/account/refresh", "/api/login", "/api/logout", "/api/control/run", "/api/control/pause", "/api/control/cancel-pending", "/api/positions/carry", "/api/positions/adopt"}:
             self.send_error(404)
             return
-        if not is_authorized_monitor_request(self.headers):
-            self._send_json(401, {"ok": False, "error": "Invalid or missing monitor token."})
+        if parsed.path != "/api/login" and not self._authorized():
+            self._send_json(401, {"ok": False, "error": "로그인이 필요합니다."})
+            return
+        if not self._browser_write_allowed():
+            self._send_json(403, {"ok": False, "error": "다른 출처의 요청은 허용하지 않습니다."})
             return
         try:
             length = int(self.headers.get("Content-Length", "0") or "0")
@@ -1007,6 +1293,64 @@ class MonitorHandler(BaseHTTPRequestHandler):
                 payload = {key: values[-1] for key, values in parsed_form.items()}
             if not isinstance(payload, dict):
                 raise ValueError("Settings payload must be an object.")
+            if parsed.path in {"/api/positions/carry", "/api/positions/adopt"}:
+                risk = getattr(self.server, "risk", None)
+                if not isinstance(risk, PositionRiskManager):
+                    raise ValueError("보유 관리 실행기가 없습니다.")
+                if parsed.path.endswith("/carry"):
+                    risk.carry(payload.get("symbol"), payload.get("cycle"), payload.get("allowed"))
+                else:
+                    risk.adopt(payload.get("symbol"), payload.get("acquiredDate"), payload.get("confirmed"))
+                self._send_json(200, {"ok": True})
+                return
+            if parsed.path in {"/api/login", "/api/logout"}:
+                auth = getattr(self.server, "auth", None)
+                if not isinstance(auth, DashboardAuth):
+                    raise ValueError("Login service unavailable.")
+                if parsed.path == "/api/login":
+                    try:
+                        token = auth.login(payload.get("username"), payload.get("password"), self.client_address[0])
+                    except LoginError as exc:
+                        self._send_json(exc.status, {"ok": False, "error": str(exc)})
+                        return
+                    auth.logout(self.headers)
+                    self._send_json(200, {"ok": True}, cookie=auth.cookie(token))
+                else:
+                    auth.logout(self.headers)
+                    self._send_json(200, {"ok": True}, cookie=auth.cookie("", clear=True))
+                return
+            if parsed.path.startswith("/api/control/"):
+                control = getattr(self.server, "control", None)
+                if not isinstance(control, RunController):
+                    self._send_json(409, {"ok": False, "error": "수동 실행은 daily-market 실행기에서 사용할 수 있습니다."})
+                    return
+                try:
+                    if parsed.path.endswith("/pause"):
+                        state = control.pause(payload.get("paused"))
+                    elif parsed.path.endswith("/cancel-pending"):
+                        state = control.cancel_pending(payload.get("requestId"))
+                    else:
+                        settings = load_trading_settings()
+                        if payload.get("action") == "trade" and not is_regular_market_open(
+                            datetime.now(KOREA_TZ), open_text=settings.get("market_open", DEFAULT_MARKET_OPEN),
+                            close_text=settings.get("market_close", DEFAULT_MARKET_CLOSE),
+                            holidays=holiday_dates(settings.get("holiday_dates", "")),
+                        ):
+                            raise ValueError("매매 실행은 설정된 정규장 시간에만 가능합니다.")
+                        state = control.submit(payload, settings)
+                except BusyError as exc:
+                    self._send_json(409, {"ok": False, "error": str(exc), "control": control.snapshot()})
+                    return
+                self._send_json(202, {"ok": True, "control": state})
+                return
+            if parsed.path == "/api/account/refresh":
+                try:
+                    refresh_account(LOCAL_DIR, payload.get("mode", "dry-run"), load_trading_settings().get("paper_capital", DEFAULT_PAPER_CAPITAL))
+                except Exception as exc:
+                    self._send_json(503, {"ok": False, "error": f"계좌 갱신 실패 ({type(exc).__name__}). API 설정과 연결을 확인하세요."})
+                    return
+                self._send_json(200, {"ok": True})
+                return
             saved = save_trading_settings(payload)
         except (ValueError, TypeError, ArithmeticError) as exc:
             self._send_json(400, {"ok": False, "error": str(exc)})
@@ -1017,14 +1361,32 @@ class MonitorHandler(BaseHTTPRequestHandler):
         return
 
 
-def start_monitor_server(host: str, port: int, *, scenario: str = "auto-paper") -> ThreadingHTTPServer:
+def start_monitor_server(host: str, port: int, *, scenario: str = "auto-paper", control=None, risk=None) -> ThreadingHTTPServer:
     bind_host, access_host = resolve_monitor_host(host)
     server = ThreadingHTTPServer((bind_host, port), MonitorHandler)
+    server.auth = DashboardAuth(LOCAL_DIR / "config/web_login.json",
+                               secure_cookie=os.getenv("TRADINGAGENTS_WEB_SECURE_COOKIE", "").lower() in {"1", "true"})
+    server.control = control
+    server.risk = risk
     ensure_monitor_token()
     port = server.server_address[1]
     server.monitor_url = f"http://{access_host}:{port}"  # type: ignore[attr-defined]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    server.account_stop = threading.Event()
+
+    def sample_account():
+        # Record valuations even when no browser is open. No orders are sent.
+        while not server.account_stop.is_set():
+            try:
+                refresh_account(LOCAL_DIR, "live" if scenario in {"auto-live", "korea-execute"} else "dry-run",
+                    load_trading_settings().get("paper_capital", DEFAULT_PAPER_CAPITAL))
+            except Exception:
+                pass  # The authenticated refresh endpoint reports connection errors.
+            server.account_stop.wait(300)
+
+    server.account_thread = threading.Thread(target=sample_account, daemon=True)
+    server.account_thread.start()
     write_monitor_status(
         "monitor-started",
         scenario=scenario,
@@ -1089,6 +1451,7 @@ def order_budget(args: argparse.Namespace) -> Decimal:
 
 
 def daily_profit_target(args: argparse.Namespace) -> Decimal:
+    # Legacy report compatibility only; never used as an execution trigger.
     capital = Decimal(args.paper_capital)
     target_return = Decimal(args.daily_target_return)
     return (capital * target_return).quantize(Decimal("1"))
@@ -1098,14 +1461,18 @@ def trading_objective(args: argparse.Namespace) -> dict[str, str]:
     return {
         "style": args.trading_style,
         "capital_krw": str(Decimal(args.paper_capital).quantize(Decimal("1"))),
-        "daily_target_return": str(Decimal(args.daily_target_return)),
-        "daily_target_profit_krw": str(daily_profit_target(args)),
+        "target_scope": "per-position gross price return; not daily account return",
+        "position_target_return": str(Decimal(getattr(args, "position_target_return", "0.01"))),
+        "position_stop_loss": str(getattr(args, "position_stop_loss", "0.005")),
+        "daily_loss_limit": str(getattr(args, "daily_loss_limit", "0.02")),
         "per_trade_budget_krw": str(order_budget(args)),
-        "holding_period": "same-day only; avoid overnight exposure unless the final risk decision explicitly says HOLD",
+        "holding_period": "Same-day liquidation by default. Only explicit user approval permits one overnight hold; liquidate by the second trading session including acquisition day. HOLD never authorizes an extension.",
         "risk_note": (
             "This is a trading objective, not a guarantee. Agents should "
             "prefer liquid Korean stocks with clear intraday catalysts, define "
-            "entry/stop/exit levels, and avoid chasing illiquid or already-spiked names."
+            "entry/stop/exit levels, and avoid chasing illiquid or already-spiked names. "
+            "Only a deterministic completed-5m-bar VWAP/volume/price-action filter may authorize entry. "
+            "Gross per-position price target excludes fees, taxes and slippage. No daily profit quota."
         ),
     }
 
@@ -1182,7 +1549,7 @@ def collect_korea_news_snapshot(args: argparse.Namespace) -> dict[str, Any] | No
     output_path = (
         LOCAL_DIR
         / "news"
-        / f"analysis_naver_{safe_ticker_component(args.korea_ticker)}_{args.date}.json"
+        / f"analysis_naver_{safe_ticker_component(args.korea_ticker)}_{args.date}_{datetime.now():%H%M%S_%f}.json"
     )
     try:
         articles = collect_news_naver(
@@ -1273,8 +1640,8 @@ def collect_candidate_snapshot(args: argparse.Namespace) -> dict[str, Any]:
         f"- Period: {start_date} to {args.date}",
         f"- Configured capital: {args.paper_capital} KRW",
         f"- Per-trade budget: {order_budget(args)} KRW",
-        f"- Daily target return: {Decimal(args.daily_target_return):.2%}",
-        f"- Daily target profit: {daily_profit_target(args)} KRW",
+        f"- Per-position gross target return: {Decimal(getattr(args, 'position_target_return', '.01')):.2%}",
+        "- Target scope: each position, before fees/taxes/slippage; no daily profit quota",
         f"- Trading style: {args.trading_style}",
         f"- Article count: {len(articles)}",
         f"- Candidate count: {len(candidates)}",
@@ -1350,6 +1717,7 @@ def run_minimal(args: argparse.Namespace) -> dict[str, Any]:
 
 
 async def run_korea_toss(args: argparse.Namespace, *, execute: bool) -> dict[str, Any]:
+    checkpoint("news-collection")
     if execute and not args.yes:
         raise SystemExit(
             "실제 Toss 주문은 --scenario auto-live 또는 korea-execute 와 --yes 를 함께 지정해야 실행됩니다."
@@ -1357,6 +1725,7 @@ async def run_korea_toss(args: argparse.Namespace, *, execute: bool) -> dict[str
 
     quick_model, deep_model, backend_url = resolve_models(args)
     collected_news = collect_korea_news_snapshot(args)
+    checkpoint("analysis")
     collected_news_path = collected_news["path"] if collected_news and collected_news.get("ok") else None
     config = make_config(
         args, korea_mode=True, minimal_mode=False, collected_news_path=collected_news_path,
@@ -1386,31 +1755,42 @@ async def run_korea_toss(args: argparse.Namespace, *, execute: bool) -> dict[str
         final_state, decision = graph.propagate(args.korea_ticker, args.date)
         store.save_analysis(run_id, final_state)
         report_path = graph.save_reports(final_state, args.korea_ticker)
+        checkpoint("planning")
         stage = "PLANNING"
         plan = plan_from_decision(
             final_state.get("final_trade_decision") or decision,
             args.korea_ticker, max_order_amount=order_budget(args),
         )
         store.event(run_id, "PLANNED", {"plan": plan.__dict__, "reportPath": str(report_path)})
-        if args.scenario in AUTO_SCENARIOS and (args.run_mode == "daily-market" or execute) and not is_regular_market_open(
+        if getattr(args, "_analysis_only", False):
+            execution = {"executed": False, "dryRun": not execute, "skipped": "analysis-only", "plan": plan.__dict__}
+        elif args.scenario in AUTO_SCENARIOS and (args.run_mode == "daily-market" or execute) and not is_regular_market_open(
             datetime.now(KOREA_TZ), open_text=args.market_open, close_text=args.market_close,
             holidays=holiday_dates(args.holiday_dates),
         ):
             execution = {"executed": False, "dryRun": not execute, "skipped": "market-closed", "plan": plan.__dict__}
         else:
+            checkpoint("order-preparation")
+            if execute:
+                require_resolved_live_orders()
             stage = "ORDER_ATTEMPT"
             # Persist intent before any external side effect. The broker journal
             # remains authoritative if the process dies before RESULT is saved.
             store.event(run_id, stage, {"plan": plan.__dict__, "fillVerified": False})
-            execution = await execute_plan(
-                plan, execute=execute,
-                live_order_log=LOCAL_DIR / "live_orders" / "orders.jsonl",
-                experience_run_id=run_id,
-            )
+            risk = getattr(args, "_position_manager", None)
+            if risk:
+                execution = await asyncio.to_thread(risk.execute, plan, run_id)
+            else:
+                execution = await execute_plan(
+                    plan, execute=execute,
+                    live_order_log=LOCAL_DIR / "live_orders" / "orders.jsonl",
+                    experience_run_id=run_id,
+                    **({"paper_account_path": LOCAL_DIR / "accounts" / "paper.sqlite3", "paper_capital": args.paper_capital} if not execute and args.date == today_korea().isoformat() else {}),
+                )
         stage = "RESULT_PERSISTENCE"
-        store.event(run_id, "RESULT", {"execution": execution, "fillVerified": False, "realizedPnl": None})
+        store.event(run_id, "RESULT", {"execution": execution, "fillVerified": execution.get("fillVerified", False), "realizedPnl": None})
     except BaseException as exc:
-        store.event(run_id, "INTERRUPTED" if not isinstance(exc, Exception) else "ERROR", {
+        store.event(run_id, "INTERRUPTED" if isinstance(exc, RunStopped) or not isinstance(exc, Exception) else "ERROR", {
             "stage": stage, "error": str(exc), "errorType": type(exc).__name__,
             "fillVerified": False, "realizedPnl": None,
         })
@@ -1424,7 +1804,7 @@ async def run_korea_toss(args: argparse.Namespace, *, execute: bool) -> dict[str
         "deepModel": deep_model,
         "backendUrl": backend_url,
         "agentRouting": describe_routing(config),
-        "ok": True,
+        "ok": execution.get("ok", (execution.get("paperExecution") or {}).get("status") != "SIMULATED_REJECTED"),
         "decision": decision,
         "reportPath": str(report_path),
         "collectedNews": collected_news,
@@ -1446,15 +1826,21 @@ async def run_auto_live(args: argparse.Namespace) -> dict[str, Any]:
     args.date = run_date
     if not is_regular_market_open(datetime.now(KOREA_TZ), open_text=args.market_open, close_text=args.market_close, holidays=holiday_dates(args.holiday_dates)):
         raise ValueError("Live trading can only execute during the configured regular session.")
-    if has_scheduler_completed(run_date, "auto-live"):
-        raise RuntimeError("A live run was already started today; automatic replay is disabled.")
-    mark_live_run_started(run_date)
+    slot = active_trading_slot(datetime.now(KOREA_TZ))
+    requested_slot = getattr(args, "_schedule_slot", None)
+    if args.run_mode == "daily-market" and requested_slot is not None and requested_slot != slot:
+        raise ValueError("Scheduled trading slot is no longer current.")
+    args._schedule_slot = slot
+    if has_scheduler_completed(run_date, "auto-live", slot):
+        raise RuntimeError("A live run was already started in this time slot; automatic replay is disabled.")
+    mark_live_run_started(run_date, slot)
     summary = await run_auto_trading(args, execute=True)
-    mark_scheduler_completed(run_date, summary.get("summaryPath"), "completed" if summary["ok"] else "completed-with-errors", scenario="auto-live")
+    mark_scheduler_completed(run_date, summary.get("summaryPath"), "completed" if summary["ok"] else "completed-with-errors", scenario="auto-live", slot=slot)
     return summary
 
 
 async def run_auto_trading(args: argparse.Namespace, *, execute: bool) -> dict[str, Any]:
+    checkpoint("candidate-discovery")
     if execute and not args.yes:
         raise SystemExit("Actual Toss orders require --yes.")
     scenario = "auto-live" if execute else "auto-paper"
@@ -1462,7 +1848,9 @@ async def run_auto_trading(args: argparse.Namespace, *, execute: bool) -> dict[s
         args.date = today_korea().isoformat()
     quick_model, deep_model, backend_url = resolve_models(args)
     candidate_snapshot = collect_candidate_snapshot(args)
+    checkpoint("candidates-collected")
     candidates = candidate_snapshot.get("candidates", [])
+    candidate_names = {row["ticker"]: row.get("name") for row in candidates}
     tickers = [row["ticker"] for row in candidates[: max(args.trade_candidates, 0)]]
     if not tickers and args.trade_candidates != 0:
         tickers = [args.korea_ticker]
@@ -1471,6 +1859,7 @@ async def run_auto_trading(args: argparse.Namespace, *, execute: bool) -> dict[s
     original_ticker = args.korea_ticker
     try:
         for ticker in tickers:
+            checkpoint("next-candidate")
             if (args.run_mode == "daily-market" or execute) and not is_regular_market_open(
                 datetime.now(KOREA_TZ), open_text=args.market_open, close_text=args.market_close,
                 holidays=holiday_dates(args.holiday_dates),
@@ -1484,6 +1873,8 @@ async def run_auto_trading(args: argparse.Namespace, *, execute: bool) -> dict[s
             try:
                 result = await run_korea_toss(args, execute=execute)
                 result["candidateRank"] = candidate_rank
+            except RunStopped:
+                raise
             except Exception as exc:
                 result = {
                     "scenario": "korea-execute" if execute else "korea-dry-run",
@@ -1494,6 +1885,7 @@ async def run_auto_trading(args: argparse.Namespace, *, execute: bool) -> dict[s
                     "ok": False,
                     "error": str(exc),
                 }
+            result["name"] = result.get("name") or candidate_names.get(ticker)
             analyses.append(result)
     finally:
         args.korea_ticker = original_ticker
@@ -1509,11 +1901,12 @@ async def run_auto_trading(args: argparse.Namespace, *, execute: bool) -> dict[s
         "backendUrl": backend_url,
         "paperCapital": args.paper_capital,
         "positionPct": args.position_pct,
-        "dailyTargetReturn": args.daily_target_return,
-        "dailyTargetProfit": str(daily_profit_target(args)),
+        "targetScope": "position",
+        "positionTargetReturn": getattr(args, "position_target_return", ".01"),
         "perTradeBudget": str(order_budget(args)),
         "tradingObjective": trading_objective(args),
         "runMode": args.run_mode,
+        "scheduleSlot": getattr(args, "_schedule_slot", None),
         "marketHours": {
             "timezone": "Asia/Seoul",
             "open": args.market_open,
@@ -1530,10 +1923,85 @@ async def run_auto_trading(args: argparse.Namespace, *, execute: bool) -> dict[s
     prefix = scenario.replace("-", "_")
     output_dir = LOCAL_DIR / prefix
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"{prefix}_{args.date}_{datetime.now():%Y%m%d_%H%M%S}.json"
+    output_path = output_dir / f"{prefix}_{args.date}_{datetime.now():%Y%m%d_%H%M%S_%f}.json"
     atomic_write_json(output_path, summary)
     summary["summaryPath"] = str(output_path)
     return summary
+
+
+def require_resolved_live_orders():
+    path = LOCAL_DIR / "live_orders/orders.jsonl"
+    if not path.exists():
+        return
+    latest = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        row = json.loads(line)
+        order_id = row.get("payload", {}).get("clientOrderId")
+        if order_id:
+            latest[order_id] = row.get("status")
+    if any(status in {"SUBMITTING", "UNCONFIRMED"} for status in latest.values()):
+        raise ValueError("접수 결과가 불확실한 실제 주문이 있습니다. Toss 주문 내역과 로그를 대조하기 전 새 주문을 차단합니다.")
+
+
+async def run_manual_job(base_args, control, job):
+    # Freeze settings when queued; later web edits cannot mutate a running job.
+    args = argparse.Namespace(**deepcopy({key: value for key, value in vars(base_args).items() if key not in {"_controller", "_position_manager"}}))
+    args._position_manager = getattr(base_args, "_position_manager", None)
+    for key, value in job["settings"].items():
+        setattr(args, key, value)
+    args.date = today_korea().isoformat()
+    args.korea_ticker = job["ticker"]
+    args.skip_news_collection = False
+    args._analysis_only = job["action"] == "analyze"
+    args.run_mode = "daily-market"
+    result = None
+    status = "completed"
+    reserved_slot = None
+    write_monitor_status("running-manual", executionMode="live" if control.live else "dry-run",
+                         scenario=args.scenario, action=job["action"], jobId=job["id"])
+    try:
+        with control.scope():
+            checkpoint("starting")
+            if job["action"] == "news":
+                result = collect_korea_news_snapshot(args)
+            elif job["action"] == "candidates":
+                result = collect_candidate_snapshot(args)
+            elif job["action"] == "analyze":
+                result = await run_korea_toss(args, execute=control.live)
+            else:
+                if not is_regular_market_open(datetime.now(KOREA_TZ), open_text=args.market_open,
+                                              close_text=args.market_close, holidays=holiday_dates(args.holiday_dates)):
+                    raise ValueError("대기 중 정규장이 종료되어 매매를 실행하지 않았습니다.")
+                if control.live:
+                    require_resolved_live_orders()
+                slot = active_trading_slot(datetime.now(KOREA_TZ))
+                args._schedule_slot = slot
+                if not has_scheduler_completed(args.date, args.scenario, slot):
+                    mark_run_started(args.date, args.scenario, slot)
+                    reserved_slot = slot
+                result = await run_auto_trading(args, execute=control.live)
+            checkpoint("finished")
+            if isinstance(result, dict) and result.get("ok") is False:
+                status = "completed-with-errors"
+    except RunStopped as exc:
+        status, result = "stopped", {"ok": False, "error": str(exc)}
+    except Exception as exc:
+        status, result = "failed", {"ok": False, "error": str(exc)}
+    finally:
+        control.finish(status, result)
+        if reserved_slot:
+            mark_scheduler_completed(args.date, (result or {}).get("summaryPath"), status,
+                                     scenario=args.scenario, slot=reserved_slot)
+        write_monitor_status(status, executionMode="live" if control.live else "dry-run",
+                             scenario=args.scenario, action=job["action"], jobId=job["id"])
+
+
+async def scheduler_wait(args, seconds):
+    control = getattr(args, "_controller", None)
+    if control:
+        await asyncio.to_thread(control.wait, seconds)
+    else:
+        await asyncio.sleep(seconds)
 
 
 async def run_daily_market_scheduler(args: argparse.Namespace) -> int:
@@ -1549,15 +2017,25 @@ async def run_daily_market_scheduler(args: argparse.Namespace) -> int:
         "timezone": "Asia/Seoul",
         "marketOpen": args.market_open,
         "marketClose": args.market_close,
+        "additionalRunTime": AFTERNOON_RUN_TIME,
         "paperCapital": args.paper_capital,
-        "dailyTargetReturn": args.daily_target_return,
-        "dailyTargetProfit": str(daily_profit_target(args)),
+        "targetScope": "position",
+        "positionTargetReturn": getattr(args, "position_target_return", ".01"),
         "perTradeBudget": str(order_budget(args)),
         "holidayDates": sorted(day.isoformat() for day in holidays),
     }
     write_monitor_status("scheduler-started", **startup_status)
     print(json.dumps({"status": "scheduler-started", **startup_status}, ensure_ascii=False), flush=True)
     while True:
+        control = getattr(args, "_controller", None)
+        if control:
+            job = control.start()
+            if job:
+                await run_manual_job(args, control, job)
+                continue
+            if control.snapshot()["paused"]:
+                await scheduler_wait(args, max(args.scheduler_poll_seconds, 1))
+                continue
         apply_trading_settings(args)
         holidays = holiday_dates(args.holiday_dates)
         now = datetime.now(KOREA_TZ)
@@ -1568,52 +2046,74 @@ async def run_daily_market_scheduler(args: argparse.Namespace) -> int:
             close_text=args.market_close,
             holidays=holidays,
         ):
-            if has_scheduler_completed(run_date, scenario):
-                next_open = next_regular_market_open(
-                    now + timedelta(days=1),
-                    open_text=args.market_open,
-                    close_text=args.market_close,
-                    holidays=holidays,
-                )
+            slot = active_trading_slot(now)
+            entry_ready = datetime.combine(now.date(), parse_hhmm(args.market_open), tzinfo=KOREA_TZ) + timedelta(minutes=20)
+            if slot == "morning" and now < entry_ready:
+                write_monitor_status("waiting-for-completed-bars", **mode_status,
+                                     nextRunAfter=entry_ready.isoformat(timespec="seconds"))
+                await scheduler_wait(args, min(max(1, int((entry_ready - now).total_seconds())), max(args.scheduler_poll_seconds, 1)))
+                continue
+            if has_scheduler_completed(run_date, scenario, slot):
+                next_open = next_trading_slot_time(now, args, holidays)
                 wait_seconds = max(1, int((next_open - now).total_seconds()))
                 status_payload = {
                     **mode_status,
                     "scheduler": "daily-market",
                     "date": run_date,
+                    "scheduleSlot": slot,
                     "nextRunAfter": next_open.isoformat(timespec="seconds"),
                 }
-                outcome = load_scheduler_state(scenario).get("runs", {}).get(run_date, {}).get("status", "completed")
+                outcome = load_scheduler_state(scenario)["runs"][run_date]["slots"][slot]["status"]
                 if outcome == "started":
-                    outcome = "interrupted-live-run"
-                write_monitor_status("already-completed" if outcome == "completed" else outcome, **status_payload)
+                    outcome = "interrupted-live-run" if scenario == "auto-live" else "interrupted-paper-run"
+                wait_status = "waiting-for-afternoon-run" if next_open.date() == now.date() else "already-completed"
+                if outcome != "completed":
+                    wait_status = outcome
+                write_monitor_status(wait_status, **status_payload)
                 print(
-                    json.dumps({"status": "already-completed", **status_payload}, ensure_ascii=False),
+                    json.dumps({"status": wait_status, **status_payload}, ensure_ascii=False),
                     flush=True,
                 )
-                await asyncio.sleep(min(wait_seconds, max(args.scheduler_poll_seconds, 1)))
+                await scheduler_wait(args, min(wait_seconds, max(args.scheduler_poll_seconds, 1)))
                 continue
 
+            if control:
+                job = control.start(scheduled_job())
+                if not job:
+                    continue
+                if job["source"] == "manual":
+                    await run_manual_job(args, control, job)
+                    continue
             args.date = run_date
-            status_payload = {**mode_status, "scheduler": "daily-market", "date": run_date}
+            args._schedule_slot = slot
+            status_payload = {**mode_status, "scheduler": "daily-market", "date": run_date, "scheduleSlot": slot}
             write_monitor_status(f"running-{scenario}", **status_payload)
             print(json.dumps({"status": f"running-{scenario}", **status_payload}, ensure_ascii=False), flush=True)
             try:
-                summary = await (run_auto_live(args) if scenario == "auto-live" else run_auto_paper(args))
+                with control.scope() if control else nullcontext():
+                    if scenario == "auto-paper":
+                        mark_run_started(run_date, scenario, slot)
+                    summary = await (run_auto_live(args) if scenario == "auto-live" else run_auto_paper(args))
             except Exception as exc:
-                summary = {**mode_status, "ok": False, "date": run_date, "error": str(exc)}
+                summary = {**mode_status, "ok": False, "date": run_date, "scheduleSlot": slot, "error": str(exc)}
+                if isinstance(exc, RunStopped):
+                    summary["stopped"] = True
                 prefix = scenario.replace("-", "_")
-                error_path = LOCAL_DIR / prefix / f"{prefix}_{run_date}_failed.json"
+                error_path = LOCAL_DIR / prefix / f"{prefix}_{run_date}_{slot}_failed.json"
                 atomic_write_json(error_path, summary)
                 summary["summaryPath"] = str(error_path)
             # Record partial failure separately and avoid replaying successful
-            # paper orders automatically. A new session starts the next day.
-            outcome = "completed" if summary.get("ok", True) else "completed-with-errors"
-            mark_scheduler_completed(run_date, summary.get("summaryPath"), outcome, scenario=scenario)
+            # orders automatically within a slot. The next slot is independent.
+            outcome = "stopped" if summary.get("stopped") else "completed" if summary.get("ok", True) else "completed-with-errors"
+            if control:
+                control.finish(outcome, summary)
+            mark_scheduler_completed(run_date, summary.get("summaryPath"), outcome, scenario=scenario, slot=slot)
             write_monitor_status(
                 outcome,
                 **mode_status,
                 scheduler="daily-market",
                 date=run_date,
+                scheduleSlot=slot,
                 summaryPath=summary.get("summaryPath"),
             )
             print(json.dumps({"results": [summary]}, ensure_ascii=False, indent=2), flush=True)
@@ -1634,7 +2134,7 @@ async def run_daily_market_scheduler(args: argparse.Namespace) -> int:
         }
         write_monitor_status("waiting-for-market-open", **status_payload)
         print(json.dumps({"status": "waiting-for-market-open", **status_payload}, ensure_ascii=False), flush=True)
-        await asyncio.sleep(min(wait_seconds, max(args.scheduler_poll_seconds, 1)))
+        await scheduler_wait(args, min(wait_seconds, max(args.scheduler_poll_seconds, 1)))
 
 
 @contextmanager
@@ -1676,9 +2176,20 @@ async def _main_async(args: argparse.Namespace) -> int:
         for key, value in load_trading_settings().items():
             if key not in explicit:
                 setattr(args, key, value)
+    risk = None
+    if args.scenario in AUTO_SCENARIOS | {"korea-dry-run", "korea-execute"} and (not args.date or args.date == today_korea().isoformat()):
+        live = args.scenario in {"auto-live", "korea-execute"}
+        if live and not args.yes:
+            raise SystemExit("Live position management requires --yes.")
+        risk = PositionRiskManager(LOCAL_DIR, live=live, settings=lambda: {**default_settings(args), **load_trading_settings()})
+        args._position_manager = risk
     monitor_server = None
     if args.monitor:
-        monitor_server = start_monitor_server(args.monitor_host, args.monitor_port, scenario=args.scenario)
+        control = None
+        if args.scenario in AUTO_SCENARIOS and args.run_mode == "daily-market":
+            control = RunController(live=args.scenario == "auto-live", audit_path=LOCAL_DIR / "monitor/manual_runs.jsonl")
+            args._controller = control
+        monitor_server = start_monitor_server(args.monitor_host, args.monitor_port, scenario=args.scenario, control=control, risk=risk)
         monitor_url = getattr(monitor_server, "monitor_url", f"http://{args.monitor_host}:{args.monitor_port}")
         monitor_token = ensure_monitor_token()
         print(
@@ -1688,6 +2199,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                     "url": monitor_url,
                     "settingsTokenPath": str(monitor_token_path()),
                     "settingsTokenPreview": monitor_token[:6] + "...",
+                    "loginSetup": str(PROJECT_DIR / "Setup-Web-Login.command"),
                     "externalDeviceHint": (
                         "Install and log in to Tailscale on your phone, then open this URL."
                         if args.monitor_host.strip().lower() == "tailscale"
@@ -1700,22 +2212,27 @@ async def _main_async(args: argparse.Namespace) -> int:
         )
 
     try:
+        if risk:
+            risk.start()
         return await run_scenarios(args)
     finally:
+        if risk:
+            await asyncio.to_thread(risk.stop)
         if monitor_server:
+            monitor_server.account_stop.set()
             monitor_server.shutdown()
             monitor_server.server_close()
 
 
 async def run_scenarios(args: argparse.Namespace) -> int:
     results: list[dict[str, Any]] = []
-    # Recommended OpenAI setup:
+    # Default hybrid setup (local news, OpenAI for the other roles):
     #   Put OPENAI_API_KEY, NAVER_CLIENT_ID, NAVER_CLIENT_SECRET, and Toss keys
     #   in /Users/leejang2/Project/.env, then run:
     #   python main.py
     #   python main.py --provider openai --model gpt-5.5
     #
-    # Local routing is opt-in again. Web settings apply between runs.
+    # Web settings apply between runs. OpenAI-only remains selectable.
     #   python main.py --provider hybrid --ollama-quick-model qwen3:8b
     #   python main.py --provider ollama --ollama-deep-model gemma3:12b
     # Roll back to cloud with --provider openai (no local code removal needed).

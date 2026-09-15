@@ -1,0 +1,16 @@
+.account-toolbar {display:flex;flex-wrap:wrap;gap:12px;align-items:end;margin-bottom:16px;}
+.account-toolbar fieldset {margin:0;padding:0;border:0;min-width:0;}
+.account-toolbar legend {font-size:12px;color:#5a667a;margin-bottom:6px;}
+.account-options {display:flex;flex-wrap:wrap;gap:4px;}
+.account-options label {display:flex;align-items:center;gap:5px;padding:8px;background:#e9edf2;border-radius:4px;color:#273548;cursor:pointer;}
+.account-options input {width:14px;height:14px;margin:0;accent-color:#147669;}
+.account-options label:has(input:checked) {background:#d9efea;color:#174b40;}
+.account-toolbar>label {flex:1 1 160px;max-width:260px;}
+.account-scroll {overflow-x:auto;min-width:0;}
+#account-panel {overflow:visible;}
+#account-results {min-width:0;}
+#account-results h3 {margin-top:24px;}
+#account-results p {font-size:13px;color:#5a667a;overflow-wrap:anywhere;}
+#account-metrics {margin-top:12px;}
+#account-metrics .value {font-size:17px;}
+@media(max-width:480px) {.account-toolbar>label {max-width:none;}.account-toolbar button {min-height:42px;}}

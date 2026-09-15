@@ -153,11 +153,11 @@ Comparison artifacts are saved under:
 
 ## Selectable OpenAI + Ollama Mode
 
-`main.py` supports `--provider openai`, `ollama`, and `hybrid`. OpenAI remains
-the default. Hybrid now defaults to local news only, to limit local latency.
-Select providers/models from the dashboard's LLM settings and save with the
-monitor token. Existing runs retain their settings; the next run uses the new
-settings. This does not start an extra same-day run.
+`main.py` supports `--provider openai`, `ollama`, and `hybrid`. Hybrid is the
+default and routes only news to the local model by default.
+After dashboard login, select providers/models and save. Existing runs retain
+their settings; subsequent requests use the saved settings. Saving alone does
+not start a run; the separate manual controls can request an additional run.
 
 ```bash
 cd /Users/leejang2/Project/TradingAgents
@@ -266,24 +266,26 @@ orders instead of dry-run records. `Start-Live.command` launches this mode
 with the Tailscale dashboard. Stop the other launcher before switching modes.
 Paper/live completion files and summary directories are separate. A live run
 is durably marked started before analysis; interrupted runs are not replayed
-automatically on the same date. Broker request/response events are recorded in
+automatically in the same morning/afternoon slot. Broker request/response events are recorded in
 `.local/live_orders/orders.jsonl` and do not imply verified fills.
 See [one-click launchers](one_click_launchers.md) for details and limitations.
-Running only `main.py` keeps the process alive and performs the workflow once
-per Korean regular market session, Monday-Friday, between 09:00 and 15:30
+Running only `main.py` keeps the process alive and performs the workflow at
+09:20 and again at 13:00, with holdings monitoring from 09:00 to 15:30
 Asia/Seoul:
 
 1. Naver keyword-based candidate discovery
-2. Top candidate analysis with external OpenAI LLMs
-3. Toss dry-run paper trade recording when the final rating maps to BUY/SELL
+2. Top candidate analysis with hybrid LLMs (Ollama news, OpenAI other roles by default)
+3. Deterministic 5m entry filters and risk sizing before BUY; simulated account fills or verified Toss orders
 
 The current project objective is Korean-stock intraday paper trading with
-10,000,000 KRW capital and a daily target return of 1%. This means the daily
-paper profit target is 100,000 KRW. The default per-candidate BUY budget is
+10,000,000 KRW capital and a per-position gross price target of +1%.
+There is no daily account profit quota. The default per-candidate BUY budget cap is
 10% of paper capital, so 1,000,000 KRW. Agents receive this objective in the
 Research Manager, Trader, and Portfolio Manager prompts so decisions prefer
 liquid same-day setups with explicit entry, stop-loss, take-profit, and exit
 discipline.
+Position stops, daily loss limits and full-exit verification are described in
+[the intraday strategy guide](intraday_strategy.md).
 
 ```bash
 cd /Users/leejang2/Project/TradingAgents
@@ -298,7 +300,8 @@ the next regular session. It records completed dates in:
 ```
 
 That file prevents accidental duplicate paper-trading runs when the process is
-left running or restarted on the same trading day.
+left running or restarted in the same time slot. A late start runs only the
+current slot, not both slots back-to-back. See [twice-daily schedule](twice_daily_schedule.md).
 
 Equivalent explicit command:
 
@@ -306,7 +309,7 @@ Equivalent explicit command:
 /Users/leejang2/Project/.venv/bin/python main.py \
   --scenario auto-paper \
   --run-mode daily-market \
-  --provider openai \
+  --provider hybrid \
   --paper-capital 10000000 \
   --position-pct 0.10 \
   --daily-target-return 0.01 \
@@ -358,8 +361,10 @@ It also includes a settings form for:
 - holiday dates
 - LLM timeout
 
-Setting changes require the monitor token printed at startup. If
-`TRADINGAGENTS_MONITOR_TOKEN` is not set, `main.py` creates one under:
+Web access requires login with the credentials registered locally using
+`Setup-Web-Login.command`. Settings and account queries reuse the login session.
+Legacy API bearer tokens remain supported. If `TRADINGAGENTS_MONITOR_TOKEN` is
+not set, `main.py` creates that compatibility token under:
 
 ```text
 .local/monitor/monitor_token.txt
@@ -410,10 +415,11 @@ Open that URL from the phone browser after logging in to the same Tailscale
 tailnet. This keeps the monitor off the public internet and avoids router port
 forwarding.
 
-Use the startup token in the dashboard's token field when saving trading
-criteria. Reads work without the token; writes do not.
+Log in with the registered web credentials. Both private reads and writes
+require authentication. See [web login and manual runs](web_login_and_manual_runs.md).
 
-This never sends a real Toss order. Real orders still require:
+Viewing the dashboard never sends an order. Manual trading follows the runner's
+fixed mode and requires an additional web confirmation in live mode. CLI real orders still require:
 
 ```bash
 --scenario korea-execute --yes

@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import time
+import asyncio
+import hashlib
+import threading
+from urllib.parse import quote
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -14,6 +19,10 @@ class TossApiError(RuntimeError):
         self.payload = payload
 
 
+class OrderWindowClosed(RuntimeError):
+    """Raised before sending an order, including after slow token acquisition."""
+
+
 @dataclass
 class TossToken:
     access_token: str
@@ -24,6 +33,10 @@ class TossToken:
 
 
 class TossClient:
+    # A newly issued Toss token invalidates the previous token for the client.
+    # Share it across dashboard/quote/order clients in this process.
+    _tokens: dict[str, TossToken] = {}
+    _token_lock = threading.Lock()
     def __init__(
         self,
         client_id: str,
@@ -37,6 +50,7 @@ class TossClient:
         self.account_seq = account_seq
         self.base_url = base_url
         self._token: TossToken | None = None
+        self.order_valid_until: datetime | None = None
         self._client = httpx.AsyncClient(base_url=base_url, timeout=timeout)
 
     async def close(self) -> None:
@@ -69,6 +83,20 @@ class TossClient:
     async def get_prices(self, symbols: list[str]) -> Any:
         return await self.get("/api/v1/prices", params={"symbols": ",".join(symbols)})
 
+    async def get_orderbook(self, symbol: str) -> Any:
+        return await self.get("/api/v1/orderbook", params={"symbol": symbol})
+
+    async def get_candles(self, symbol: str, *, before=None, index=False) -> Any:
+        params = {"interval": "1m", "count": 200}
+        if before:
+            params["before"] = before
+        if index:
+            path = "/api/v1/market-indicators/" + quote(symbol, safe="") + "/candles"
+        else:
+            path = "/api/v1/candles"
+            params.update(symbol=symbol, adjusted="false")
+        return await self.get(path, params=params)
+
     async def get_buying_power(self, currency: str) -> Any:
         return await self.get(
             "/api/v1/buying-power",
@@ -76,12 +104,43 @@ class TossClient:
             require_account=True,
         )
 
+    async def get_holdings(self) -> Any:
+        return await self.get("/api/v1/holdings", require_account=True)
+
+    async def get_orders(self, *, status="CLOSED", from_date=None, to_date=None, cursor=None) -> Any:
+        if status not in {"OPEN", "CLOSED"}:
+            raise ValueError("Invalid order status group")
+        params = {"status": status, "limit": 100}
+        for key, value in (("from", from_date), ("to", to_date), ("cursor", cursor)):
+            if value:
+                params[key] = value
+        return await self.get("/api/v1/orders", params=params, require_account=True)
+
     async def create_order(self, order: dict[str, Any]) -> Any:
         return await self.post("/api/v1/orders", json=order, require_account=True)
+
+    async def get_order(self, order_id: str) -> Any:
+        return await self.get("/api/v1/orders/" + quote(order_id, safe=""), require_account=True)
+
+    async def cancel_order(self, order_id: str) -> Any:
+        return await self.post("/api/v1/orders/" + quote(order_id, safe="") + "/cancel", json={}, require_account=True)
+
+    async def get_sellable_quantity(self, symbol: str) -> Any:
+        return await self.get("/api/v1/sellable-quantity", params={"symbol": symbol}, require_account=True)
+
+    async def get_kr_calendar(self, day: str) -> Any:
+        return await self.get("/api/v1/market-calendar/KR", params={"date": day})
 
     async def get(self, path: str, params: dict[str, Any] | None = None, require_account: bool = False) -> Any:
         headers = await self._headers(require_account=require_account)
         response = await self._client.get(path, params=params, headers=headers)
+        if response.status_code == 401:
+            # Another process may have invalidated the shared client token.
+            # Retry reads once; never retry an order POST automatically.
+            self._tokens.pop(self._token_key(), None)
+            self._token = None
+            headers = await self._headers(require_account=require_account)
+            response = await self._client.get(path, params=params, headers=headers)
         return self._parse_response(response)
 
     async def post(
@@ -91,12 +150,31 @@ class TossClient:
         require_account: bool = False,
     ) -> Any:
         headers = await self._headers(require_account=require_account)
+        if path == "/api/v1/orders":
+            from tradingagents.monitoring.control import checkpoint
+            checkpoint("order-sending")
+            if self.order_valid_until and datetime.now(timezone.utc) >= self.order_valid_until:
+                raise OrderWindowClosed("주문 제한 시간이 지나 전송하지 않았습니다.")
         response = await self._client.post(path, json=json, headers=headers)
         return self._parse_response(response)
 
     async def _headers(self, require_account: bool) -> dict[str, str]:
         if self._token is None or not self._token.is_valid():
-            await self.issue_token()
+            key = self._token_key()
+            # Blocking lock acquisition must not block an asyncio event loop.
+            acquisition = asyncio.create_task(asyncio.to_thread(self._token_lock.acquire))
+            try:
+                await asyncio.shield(acquisition)
+            except asyncio.CancelledError:
+                await acquisition
+                self._token_lock.release()
+                raise
+            try:
+                self._token = self._tokens.get(key)
+                if self._token is None or not self._token.is_valid():
+                    self._tokens[key] = await self.issue_token()
+            finally:
+                self._token_lock.release()
 
         headers = {"Authorization": f"Bearer {self._token.access_token}"}
         if require_account:
@@ -104,6 +182,9 @@ class TossClient:
                 raise ValueError("TOSS_ACCOUNT_SEQ is required for account APIs.")
             headers["X-Tossinvest-Account"] = self.account_seq
         return headers
+
+    def _token_key(self):
+        return hashlib.sha256(f"{self.base_url}|{self.client_id}|{self.client_secret}".encode()).hexdigest()
 
     @staticmethod
     def _parse_response(response: httpx.Response, unwrap_result: bool = True) -> Any:

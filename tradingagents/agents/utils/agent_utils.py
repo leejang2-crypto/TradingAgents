@@ -76,8 +76,7 @@ def get_trading_objective_instruction() -> str:
 
     style = objective.get("style")
     capital = objective.get("capital_krw")
-    target_return = objective.get("daily_target_return")
-    target_profit = objective.get("daily_target_profit_krw")
+    target_return = objective.get("position_target_return")
     per_trade_budget = objective.get("per_trade_budget_krw")
     holding_period = objective.get("holding_period")
     risk_note = objective.get("risk_note")
@@ -85,8 +84,10 @@ def get_trading_objective_instruction() -> str:
         "**Trading Objective:**",
         f"- Style: {style or 'intraday'}",
         f"- Paper capital: {capital or 'unknown'} KRW",
-        f"- Daily target return: {target_return or 'unknown'}",
-        f"- Daily target profit: {target_profit or 'unknown'} KRW",
+        f"- Per-position gross price target return: {target_return or 'unknown'} (before costs)",
+        "- No daily account profit quota. Do not force trades to meet a daily target.",
+        f"- Maximum position stop distance: {objective.get('position_stop_loss') or 'unknown'}",
+        f"- Daily account loss limit: {objective.get('daily_loss_limit') or 'unknown'}",
         f"- Default per-trade budget: {per_trade_budget or 'unknown'} KRW",
         f"- Holding period: {holding_period or 'same-day preferred'}",
     ]
@@ -242,5 +243,4 @@ def create_msg_delete():
         return {"messages": removal_operations + [placeholder]}
 
     return delete_messages
-
 

@@ -77,6 +77,7 @@ def test_explicit_cli_wins_then_web_can_change_model(settings_args):
 
 
 def test_live_launcher_reads_web_settings_without_overwriting_them(settings_args, monkeypatch):
+    monkeypatch.setattr(main, "PositionRiskManager", Mock())
     main.save_trading_settings({"provider": "hybrid", "openai_quick_model": "gpt-5.4-mini"})
     saved_bytes = main.settings_path().read_bytes()
     args = main.make_parser().parse_args([
@@ -97,6 +98,7 @@ def test_live_launcher_reads_web_settings_without_overwriting_them(settings_args
 
 
 def test_live_explicit_provider_overrides_saved_provider(settings_args, monkeypatch):
+    monkeypatch.setattr(main, "PositionRiskManager", Mock())
     main.save_trading_settings({"provider": "ollama"})
     args = main.make_parser().parse_args(["--scenario", "korea-execute", "--yes", "--provider", "openai"])
     args.monitor = False
@@ -143,7 +145,7 @@ def test_local_news_is_one_tool_free_llm_call(monkeypatch):
     tool.invoke.return_value = "2026-09-09: Reported earnings; https://example.org/news"
     monkeypatch.setattr("tradingagents.agents.analysts.news_analyst.get_news", tool)
     llm = Mock()
-    llm.invoke.return_value = AIMessage(content='{"ticker":"005930.KS","items":[{"article":1,"quote":"Reported earnings","signal":"catalyst"}]}')
+    llm.invoke.return_value = AIMessage(content='{"ticker":"005930.KS","items":[{"article":1,"excerpt":1,"signal":"catalyst"}]}')
     state = {"trade_date": "2026-09-10", "company_of_interest": "005930.KS"}
     result = create_news_analyst(llm)(state)
     assert "Reported earnings" in result["news_report"]
@@ -151,15 +153,40 @@ def test_local_news_is_one_tool_free_llm_call(monkeypatch):
     llm.bind_tools.assert_not_called()
     tool.invoke.assert_called_once_with({"ticker": "005930.KS", "start_date": "2026-09-03", "end_date": "2026-09-10"})
     assert "https://example.org/news" in llm.invoke.call_args.args[0][1].content
+    assert '"excerpt":1' in llm.invoke.call_args.args[0][0].content
+    assert result["messages"][0].content == result["news_report"]
 
 
 def test_local_news_failure_does_not_silently_call_cloud(monkeypatch):
     set_config({"news_local_single_pass": True})
-    monkeypatch.setattr("tradingagents.agents.analysts.news_analyst.get_news", Mock(invoke=Mock(return_value="news")))
+    monkeypatch.setattr("tradingagents.agents.analysts.news_analyst.get_news", Mock(invoke=Mock(return_value="Reported earnings today.")))
     llm = Mock(invoke=Mock(side_effect=TimeoutError("local timeout")))
     with pytest.raises(TimeoutError):
         create_news_analyst(llm)({"trade_date": "2026-09-10", "company_of_interest": "005930.KS"})
     llm.invoke.assert_called_once()
+
+
+@pytest.mark.parametrize("response", [
+    '{"ticker":"005930.KS","items":[{"article":1,"excerpt":99,"signal":"risk"}]}',
+    '{"ticker":"005930.KS","items":[{"article":1,"quote":"Reported earnings today.","signal":"risk"}]}',
+])
+def test_local_news_invalid_selection_does_not_retry(monkeypatch, response):
+    set_config({"news_local_single_pass": True})
+    monkeypatch.setattr("tradingagents.agents.analysts.news_analyst.get_news", Mock(invoke=Mock(return_value="Reported earnings today.")))
+    llm = Mock(invoke=Mock(return_value=AIMessage(content=response)))
+    with pytest.raises(ValueError, match="unknown excerpt"):
+        create_news_analyst(llm)({"trade_date": "2026-09-10", "company_of_interest": "005930.KS"})
+    llm.invoke.assert_called_once()
+    llm.bind_tools.assert_not_called()
+
+
+def test_local_news_empty_sources_do_not_call_llm(monkeypatch):
+    set_config({"news_local_single_pass": True})
+    monkeypatch.setattr("tradingagents.agents.analysts.news_analyst.get_news", Mock(invoke=Mock(return_value="")))
+    llm = Mock()
+    with pytest.raises(ValueError, match="no usable"):
+        create_news_analyst(llm)({"trade_date": "2026-09-10", "company_of_interest": "005930.KS"})
+    llm.invoke.assert_not_called()
 
 
 def test_local_news_rejects_invented_company_and_wrong_source():

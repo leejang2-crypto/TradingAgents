@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TradingAgents 로그인</title>
+  <link rel="stylesheet" href="/assets/control.css">
+  <script src="/assets/login.js" defer></script>
+</head>
+<body class="login-page">
+  <main>
+    <h1>TradingAgents</h1>
+    <h2>로그인</h2>
+    <form id="login-form">
+      <label>ID<input name="username" autocomplete="username" required maxlength="64" autofocus></label>
+      <label>비밀번호<input name="password" type="password" autocomplete="current-password" required maxlength="256"></label>
+      <button type="submit">로그인</button>
+      <p id="login-message" role="status"></p>
+    </form>
+  </main>
+</body>
+</html>

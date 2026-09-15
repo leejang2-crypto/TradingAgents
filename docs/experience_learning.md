@@ -5,7 +5,8 @@
 `main.py`의 `auto-paper`, `auto-live`, `korea-dry-run`, `korea-execute`에서
 기본 활성화됩니다. 기존 `Start-DryRun.command`, `Start-Live.command`를 그대로
 사용하면 됩니다. 실행 중인 프로세스에는 코드 변경이 즉시 반영되지 않으므로 재시작하세요.
-기존 하루 1회 실행 제한은 유지됩니다. 재시작한다고 같은 날 분석/주문을 다시 하지 않습니다.
+자동 실행은 장 시작과 13시의 두 회차입니다. 재시작해도 이미 시작한 같은 회차를 반복하지 않습니다.
+경험 검색은 이전 거래일 기록만 사용하며, 오후 회차에 당일 오전 보고서를 자동으로 주입하지 않습니다.
 
 OpenAI, Ollama, hybrid 모두 동일한 경험 검색 기능을 사용합니다.
 새 패키지나 API 키는 필요하지 않습니다. Python 표준 SQLite를 사용합니다.
@@ -104,7 +105,8 @@ cd /Users/leejang2/Project/TradingAgents
 사용하지 않습니다. 이전 공유 Markdown 메모리와 기존 로그도 삭제하지 않았으며, 실행 모드와
 성과를 검증할 수 없는 옛 기록은 새 DB로 자동 가져오지 않습니다.
 
-현재 dry-run은 주문 의도 기록이며 체결/잔고/실현손익 시뮬레이터가 아닙니다.
+기존 dry-run 기록은 주문 의도입니다. 이후 추가된 [가상계좌 장부](account_dashboard.md)는 당일 주문의
+모의 체결/잔고/손익을 계산하지만, 경험 메모리의 성과 라벨은 아직 자동 갱신하지 않습니다.
 실전 `SUBMITTED`도 주문 응답을 받았다는 뜻이지 체결이나 수익을 입증하지 않습니다.
 따라서 경험에는 `performance=UNKNOWN`, `realizedPnl=null`, `fillVerified=false`를
 사용하며 이를 성공 보상으로 계산하지 않습니다.
