@@ -127,3 +127,57 @@ def test_account_assets_and_controls_are_available():
     status, body = request("GET", "/")
     assert status == 200 and b'account-results' in body
     assert b'name="return_period"' in body
+
+
+@pytest.mark.parametrize("mode,prefix", [("dry-run", "auto_paper"), ("live", "auto_live")])
+def test_analysis_summary_reads_exact_authenticated_file(mode, prefix):
+    directory = main.LOCAL_DIR / prefix
+    directory.mkdir()
+    name = prefix + "_2026-09-16_092000.json"
+    content = {"analyses": [{"ticker": "005930", "name": "삼성전자", "decision": "<script>alert(1)</script>"}]}
+    (directory / name).write_text(json.dumps(content, ensure_ascii=False), encoding="utf-8")
+    (directory / (prefix + "_newer.json")).write_text('{"newer":true}')
+    url = f"/api/analysis-summary?mode={mode}&file={name}"
+    assert request("GET", url, token="wrong")[0] == 401
+    status, body = request("GET", url)
+    assert status == 200
+    assert json.loads(body) == {"ok": True, "name": name, "content": content}
+
+
+@pytest.mark.parametrize("query", [
+    "", "mode=dry-run", "mode=invalid&file=auto_paper_a.json",
+    "mode=dry-run&file=../config/web_login.json", "mode=dry-run&file=%2Fetc%2Fpasswd",
+    "mode=dry-run&file=auto_live_a.json", "mode=dry-run&file=auto_paper_a.md",
+    "mode=dry-run&file=auto_paper_..%2Fconfig.json", "mode=dry-run&file=auto_paper_a.json&file=auto_paper_b.json",
+    "mode=dry-run&mode=live&file=auto_paper_a.json", "mode=dry-run&file=auto_paper_a.json&path=.env",
+])
+def test_analysis_summary_rejects_arbitrary_paths(query):
+    assert request("GET", "/api/analysis-summary?" + query)[0] == 400
+
+
+def test_analysis_summary_missing_invalid_and_large_files():
+    directory = main.LOCAL_DIR / "auto_paper"
+    directory.mkdir()
+    path = directory / "auto_paper_test.json"
+    url = "/api/analysis-summary?mode=dry-run&file=" + path.name
+    assert request("GET", url)[0] == 404
+    for raw in (b'{"incomplete":', b'"not an object"', b'\xff'):
+        path.write_bytes(raw)
+        assert request("GET", url)[0] == 422
+    path.write_bytes(b' ' * 2_000_001)
+    assert request("GET", url)[0] == 413
+
+
+def test_analysis_summary_rejects_symlink_file_and_directory(tmp_path):
+    outside = tmp_path / "secret.json"
+    outside.write_text('{"secret":"must not be served"}')
+    directory = main.LOCAL_DIR / "auto_paper"
+    directory.mkdir()
+    link = directory / "auto_paper_test.json"
+    link.symlink_to(outside)
+    url = "/api/analysis-summary?mode=dry-run&file=" + link.name
+    assert request("GET", url)[0] == 403
+    link.unlink()
+    directory.rmdir()
+    directory.symlink_to(tmp_path, target_is_directory=True)
+    assert request("GET", url)[0] == 403

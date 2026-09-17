@@ -70,7 +70,7 @@ def test_password_stored_as_salted_scrypt_hash(tmp_path):
 def test_login_protects_all_private_reads_and_sets_cookie(server):
     status, headers, _ = request(server, "GET", "/")
     assert status == 303 and headers["Location"] == "/login"
-    for path in ("/api/settings", "/api/status", "/api/account", "/api/llm-models", "/api/control", "/api/positions"):
+    for path in ("/api/settings", "/api/status", "/api/account", "/api/llm-models", "/api/control", "/api/positions", "/api/research"):
         assert request(server, "GET", path)[0] == 401
     status, headers, body = request(server, "POST", "/api/login", {"username": "owner", "password": "test-password-1234"})
     assert status == 200
@@ -81,6 +81,48 @@ def test_login_protects_all_private_reads_and_sets_cookie(server):
     assert request(server, "POST", "/api/settings", {"provider": "openai"}, cookie=cookie)[0] == 200
     assert request(server, "GET", "/api/account", cookie=cookie)[0] == 200
     assert b'settings-token' not in request(server, "GET", "/", cookie=cookie)[2]
+
+
+def test_research_is_authenticated_csrf_protected_and_separate(server, tmp_path, monkeypatch):
+    from tradingagents.research.service import ResearchService
+    server.research = ResearchService(tmp_path / "long_term", main.PROJECT_DIR)
+    submit = Mock(return_value={"available": True})
+    stop = Mock(return_value={"available": True})
+    monkeypatch.setattr(server.research, "submit", submit)
+    monkeypatch.setattr(server.research, "stop", stop)
+    payload = {"requestId": "a" * 32}
+    assert request(server, "POST", "/api/research/run", payload)[0] == 401
+    cookie = login(server)
+    assert request(server, "POST", "/api/research/run", payload, cookie=cookie, extra={"Origin": "https://evil.example"})[0] == 403
+    submit.assert_not_called()
+    original = server.control.snapshot()
+    settings = main.load_trading_settings()
+    assert request(server, "POST", "/api/research/run", payload, cookie=cookie)[0] == 202
+    submit.assert_called_once_with(payload, settings)
+    assert server.control.snapshot() == original
+    assert main.load_trading_settings() == settings
+    assert request(server, "POST", "/api/research/stop", payload, cookie=cookie)[0] == 202
+    stop.assert_called_once_with(payload["requestId"])
+    assert server.control.snapshot() == original
+    server.control.active = {"id": "scheduled-job", "phase": "analysis"}
+    assert request(server, "POST", "/api/research/run", payload, cookie=cookie)[0] == 409
+    assert submit.call_count == 1 and not server.control.cancel.is_set()
+
+
+def test_universe_upload_requires_auth_csrf_and_valid_csv(server, tmp_path):
+    from tradingagents.research.service import ResearchService
+    from tests.test_research_universe import csv_payload
+    server.research = ResearchService(tmp_path / "long_term", main.PROJECT_DIR)
+    path, payload = "/api/research/universe", csv_payload()
+    assert request(server, "POST", path, payload)[0] == 401
+    cookie = login(server)
+    assert request(server, "POST", path, payload, cookie=cookie, extra={"Origin": "https://evil.example"})[0] == 403
+    original, settings = server.control.snapshot(), main.load_trading_settings()
+    assert request(server, "POST", path, {**payload, "confirmed": False}, cookie=cookie)[0] == 400
+    status, _, body = request(server, "POST", path, payload, cookie=cookie)
+    assert status == 202 and len(json.loads(body)["universe"]["members"]) == 100
+    assert request(server, "POST", path, {**payload, "csv": "x" * 150001}, cookie=cookie)[0] == 413
+    assert server.control.snapshot() == original and main.load_trading_settings() == settings
 
 
 def test_logout_and_password_reset_invalidate_sessions(server):

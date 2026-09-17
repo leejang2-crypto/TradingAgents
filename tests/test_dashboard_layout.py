@@ -42,7 +42,7 @@ def test_layout_preserves_existing_controls_and_unique_ids():
 def test_tabs_details_and_new_assets_are_declared():
     parsed = Elements(main.render_monitor_html({}))
     tabs = [attrs for _, attrs in parsed.tags if attrs.get('role') == 'tab']
-    assert [tab['data-view'] for tab in tabs] == ['overview', 'analysis', 'history', 'execution', 'settings']
+    assert [tab['data-view'] for tab in tabs] == ['overview', 'analysis', 'research', 'history', 'execution', 'settings']
     assert all(tab['aria-controls'] == 'view-' + tab['data-view'] for tab in tabs)
     groups = [attrs for tag, attrs in parsed.tags if tag == 'details' and attrs.get('class') == 'settings-group']
     assert len(groups) == 5
@@ -65,3 +65,16 @@ def test_analysis_full_text_and_existing_fields_remain_escaped():
     for value in ('005930', '삼성전자', '/private/report.md', '/private/summary.json', '/private/candidates.json', 'qwen3:8b'):
         assert value in html
     assert '<th>Ticker</th><th>종목명</th><th>Rank</th><th>Decision / Error</th><th>Order</th><th>Report</th><th>사용 LLM</th>' in html
+
+
+def test_summary_path_opens_accessible_in_dashboard_viewer():
+    html = main.render_monitor_html({
+        'executionMode': 'live', 'latestSummaryPath': '/private/auto_live/auto_live_2026-09-16.json',
+    })
+    parsed = Elements(html)
+    links = [attrs for tag, attrs in parsed.tags if tag == 'a' and 'data-summary-link' in attrs]
+    assert len(links) == 1
+    assert links[0]['href'] == '/api/analysis-summary?mode=live&file=auto_live_2026-09-16.json'
+    assert links[0]['aria-haspopup'] == 'dialog'
+    assert any(tag == 'dialog' and attrs.get('id') == 'summary-dialog' for tag, attrs in parsed.tags)
+    assert 'data-summary-link' not in main.render_monitor_html({})

@@ -237,6 +237,12 @@ def test_order_is_not_recorded_after_market_close(settings_args, monkeypatch):
 
 
 def test_scheduler_records_errors_and_does_not_rerun_same_day(settings_args, monkeypatch):
+    class MarketTime(main.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 9, 17, 10, tzinfo=main.KOREA_TZ).astimezone(tz)
+
+    monkeypatch.setattr(main, "datetime", MarketTime)
     calls = []
     class StopLoop(Exception):
         pass

@@ -107,6 +107,12 @@ def test_live_rechecks_session_after_analysis(live_args, monkeypatch):
 
 
 def test_daily_live_scheduler_uses_shared_loop(live_args, monkeypatch):
+    class MarketTime(main.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 9, 17, 10, tzinfo=main.KOREA_TZ).astimezone(tz)
+
+    monkeypatch.setattr(main, "datetime", MarketTime)
     class StopLoop(Exception):
         pass
 

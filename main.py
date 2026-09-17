@@ -20,7 +20,7 @@ from contextlib import contextmanager, nullcontext
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import urlopen
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -47,6 +47,7 @@ from tradingagents.monitoring.auth import DashboardAuth, LoginError
 from tradingagents.monitoring.control import BusyError, RunController, RunStopped, checkpoint, scheduled_job
 from tradingagents.brokers.position_risk import PositionRiskManager, RISK_DEFAULTS
 from tradingagents.brokers.intraday import INTRADAY_DEFAULTS, DECIMAL_LIMITS, INTEGER_LIMITS
+from tradingagents.research.service import ResearchBusy, ResearchService
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -703,6 +704,38 @@ def latest_file(directory: Path, pattern: str) -> Path | None:
     return matches[0] if matches else None
 
 
+def read_analysis_summary(query: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
+    modes = {"dry-run": "auto_paper", "live": "auto_live"}
+    mode = query.get("mode", [""])
+    names = query.get("file", [""])
+    prefix = modes.get(mode[0])
+    if set(query) != {"mode", "file"} or len(mode) != 1 or len(names) != 1 or not prefix:
+        return 400, {"ok": False, "error": "분석 요약 파일 요청이 올바르지 않습니다."}
+    name = names[0]
+    if not re.fullmatch(rf"{prefix}_[A-Za-z0-9_.-]+\.json", name):
+        return 400, {"ok": False, "error": "허용된 분석 요약 파일만 열 수 있습니다."}
+    directory = LOCAL_DIR / prefix
+    path = directory / name
+    # Do not follow links out of the generated-summary directory.
+    if directory.is_symlink() or path.is_symlink():
+        return 403, {"ok": False, "error": "연결된 파일은 열 수 없습니다."}
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(2_000_001)
+        if len(raw) > 2_000_000:
+            return 413, {"ok": False, "error": "파일이 너무 큽니다. 화면에서는 2 MB 이하의 요약만 열 수 있습니다."}
+        content = json.loads(raw.decode("utf-8"))
+        if not isinstance(content, (dict, list)):
+            raise ValueError("Invalid summary")
+    except FileNotFoundError:
+        return 404, {"ok": False, "error": "분석 요약 파일을 찾을 수 없습니다. 목록을 새로고침해 주세요."}
+    except (UnicodeDecodeError, ValueError):
+        return 422, {"ok": False, "error": "분석 요약 JSON을 읽을 수 없습니다. 저장이 완료된 후 다시 시도해 주세요."}
+    except OSError:
+        return 503, {"ok": False, "error": "분석 요약 파일을 읽을 수 없습니다. 파일 권한을 확인해 주세요."}
+    return 200, {"ok": True, "name": name, "content": content}
+
+
 def read_tail_jsonl(path: Path, limit: int = 20) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -805,6 +838,13 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
             "</tr>"
         )
     live = snapshot.get("executionMode") == "live"
+    summary_path = snapshot.get("latestSummaryPath")
+    summary_link = '<span class="muted">분석 요약 파일이 아직 없습니다.</span>'
+    if summary_path:
+        summary_url = "/api/analysis-summary?" + urlencode({
+            "mode": "live" if live else "dry-run", "file": Path(summary_path).name,
+        })
+        summary_link = f'<a href="{_compact_text(summary_url)}" data-summary-link aria-haspopup="dialog"><code>{_compact_text(summary_path)}</code></a>'
     trade_rows = []
     for trade in reversed(snapshot.get("recentLiveOrders" if live else "recentTrades") or []):
         plan = trade.get("plan") or {}
@@ -857,6 +897,7 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
   <link rel="stylesheet" href="/assets/control.css">
   <link rel="stylesheet" href="/assets/dashboard.css">
   <script src="/assets/dashboard.js" defer></script>
+  <script src="/assets/research.js" defer></script>
   <script src="/assets/account.js" defer></script>
   <script src="/assets/control.js" defer></script>
   <script src="/assets/positions.js" defer></script>
@@ -985,11 +1026,54 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
   <nav id="dashboard-tabs" role="tablist" aria-label="대시보드 메뉴" hidden>
     <button type="button" role="tab" id="tab-overview" aria-controls="view-overview" aria-selected="true" data-view="overview">현황</button>
     <button type="button" role="tab" id="tab-analysis" aria-controls="view-analysis" aria-selected="false" data-view="analysis" tabindex="-1">분석</button>
+    <button type="button" role="tab" id="tab-research" aria-controls="view-research" aria-selected="false" data-view="research" tabindex="-1">중장기</button>
     <button type="button" role="tab" id="tab-history" aria-controls="view-history" aria-selected="false" data-view="history" tabindex="-1">거래 내역</button>
     <button type="button" role="tab" id="tab-execution" aria-controls="view-execution" aria-selected="false" data-view="execution" tabindex="-1">실행</button>
     <button type="button" role="tab" id="tab-settings" aria-controls="view-settings" aria-selected="false" data-view="settings" tabindex="-1">설정</button>
   </nav>
   <main id="dashboard-main">
+    <section id="research-panel">
+      <h2>중장기 종목 탐색</h2>
+      <p class="muted">연구 전용 · 자동 주문/보유 편입 없음 · 점수는 예상 수익률이 아닙니다.</p>
+      <p id="research-universe-state" role="status">코스피100 구성목록 확인 전</p>
+      <details><summary>KRX 코스피100 구성목록 등록</summary>
+        <p><a href="https://data.krx.co.kr/contents/MDC/MAIN/main/index.cmd" target="_blank" rel="noopener noreferrer">KRX 데이터 시스템</a></p>
+        <form id="research-universe-form">
+          <div class="form-grid"><label>구성종목 CSV<input id="research-universe-file" type="file" accept=".csv,text/csv" required></label>
+          <label>CSV 조회 기준일<input name="asOf" type="date" max="{today_korea().isoformat()}" required></label></div>
+          <label class="control-check"><input name="confirmed" type="checkbox" required>KRX에서 조회한 코스피100 전체 100종목 CSV임을 확인합니다.</label>
+          <button type="submit" id="research-universe-save">구성목록 등록</button>
+        </form>
+      </details>
+      <form id="research-form">
+        <div class="form-grid">
+          <label>보유 관점<select name="research_horizon"><option value="1-3">1~3개월</option><option value="3-12" selected>3~12개월</option><option value="12-36">1~3년</option></select></label>
+          <label>근거 검토 LLM<select name="research_provider"><option value="none">정량 탐색만 (LLM 미사용)</option><option value="openai">OpenAI · API 비용 발생</option><option value="ollama">Ollama · 로컬 자원 사용</option></select></label>
+        </div>
+        <label>코스피100 내 분석 종목 (비우면 전체 100종목)<textarea name="research_tickers" maxlength="2000" placeholder="005930.KS, 000660.KS"></textarea></label>
+        <details><summary>중장기 선별 조건</summary><div class="form-grid">
+          <label>후행 PER 상한 (배)<input name="research_max_pe" type="number" min="1" max="200" step="any" value="25" required></label>
+          <label>분기 매출 YoY 하한 초과 (%)<input name="research_min_revenue_growth_pct" type="number" min="-50" max="100" step="any" value="5" required></label>
+          <label>부채/자기자본 상한 (%)<input name="research_max_debt_equity" type="number" min="0" max="1000" step="any" value="100" required></label>
+          <label>252거래일 최대낙폭 상한 (%)<input name="research_max_drawdown_pct" type="number" min="1" max="100" step="any" value="45" required></label>
+          <label>주식 수 증가 상한 · 확인 시 (%)<input name="research_max_dilution_pct" type="number" min="0" max="100" step="any" value="5" required></label>
+          <label>20일 평균 거래대금 하한 (KRW)<input name="research_min_turnover_krw" type="number" min="0" max="1000000000000" step="any" value="100000000" required></label>
+          <label>추가 검증 점수 하한<input name="research_min_quality_score" type="number" min="0" max="100" step="any" value="60" required></label>
+        </div></details>
+        <div class="control-actions"><button type="submit" id="research-start">중장기 탐색 실행</button><button type="button" id="research-stop" disabled>탐색 중단</button></div>
+      </form>
+      <p id="research-state" role="status">탐색 상태 조회 전</p>
+      <p id="research-error" role="alert"></p>
+      <label>저장된 탐색 결과<select id="research-history"><option value="">최근 결과</option></select></label>
+      <div id="research-results" hidden>
+        <p id="research-meta"></p>
+        <p id="research-llm"></p>
+        <p id="research-filter-summary" class="muted"></p>
+        <details><summary>평가 기준 및 자료 유의사항</summary><ul id="research-limitations"></ul></details>
+        <div class="account-scroll"><table><thead><tr><th>종목</th><th>분류</th><th>종합 / 기존 / 검증 점수</th><th>기존 / 검증 자료 충족률</th><th>가격 / 분기 기준일</th><th>근거와 위험</th></tr></thead><tbody id="research-rows"></tbody></table></div>
+        <ul id="research-failures"></ul>
+      </div>
+    </section>
     <section id="manual-panel">
       <h2>수동 실행</h2>
       <div class="control-toolbar">
@@ -1018,6 +1102,13 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
         <button type="button" id="run-confirm">실제 주문 실행</button>
         <button type="button" id="run-dismiss">취소</button>
       </div>
+    </dialog>
+    <dialog id="summary-dialog" aria-labelledby="summary-dialog-title">
+      <div class="summary-heading"><h2 id="summary-dialog-title">분석 요약</h2>
+        <button type="button" id="summary-close" aria-label="분석 요약 닫기" title="닫기" autofocus>×</button></div>
+      <p id="summary-file" class="muted"></p>
+      <p id="summary-status" role="status"></p>
+      <pre id="summary-content" tabindex="0" hidden></pre>
     </dialog>
     <section id="positions-panel">
       <h2>보유 관리 · 청산</h2>
@@ -1153,7 +1244,7 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
       <h2>Latest Analyses</h2>
       <table><thead><tr><th>Ticker</th><th>종목명</th><th>Rank</th><th>Decision / Error</th><th>Order</th><th>Report</th><th>사용 LLM</th></tr></thead>
       <tbody>{''.join(analysis_rows) or '<tr><td colspan="7">No analysis yet</td></tr>'}</tbody></table>
-      <details data-detail-key="analysis-path"><summary>분석 요약 파일 경로</summary><p><code>{_compact_text(snapshot.get("latestSummaryPath"))}</code></p></details>
+      <details data-detail-key="analysis-path"><summary>분석 요약 파일 경로</summary><p>{summary_link}</p></details>
     </section>
     <section data-live="candidates">
       <h2>Candidate Ranking</h2>
@@ -1217,7 +1308,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
     def _get(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path in {"/assets/account.js", "/assets/account.css", "/assets/control.js", "/assets/control.css", "/assets/login.js", "/assets/positions.js", "/assets/dashboard.js", "/assets/dashboard.css"}:
+        if parsed.path in {"/assets/account.js", "/assets/account.css", "/assets/control.js", "/assets/control.css", "/assets/login.js", "/assets/positions.js", "/assets/dashboard.js", "/assets/dashboard.css", "/assets/research.js"}:
             name = parsed.path.rsplit("/", 1)[-1]
             payload = (PROJECT_DIR / "tradingagents" / "monitoring" / name).read_bytes()
             self.send_response(200)
@@ -1245,6 +1336,11 @@ class MonitorHandler(BaseHTTPRequestHandler):
                 self.end_headers()
             else:
                 self._send_json(401, {"ok": False, "error": "로그인이 필요합니다."})
+            return
+        if parsed.path == "/api/research":
+            research = getattr(self.server, "research", None)
+            self._send_json(200, research.snapshot(parse_qs(parsed.query).get("id", [None])[0])
+                if isinstance(research, ResearchService) else {"available": False})
             return
         if parsed.path == "/api/control":
             control = getattr(self.server, "control", None)
@@ -1274,6 +1370,10 @@ class MonitorHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/status":
             self._send_json(200, build_monitor_snapshot())
             return
+        if parsed.path == "/api/analysis-summary":
+            status, payload = read_analysis_summary(parse_qs(parsed.query, keep_blank_values=True))
+            self._send_json(status, payload)
+            return
         if parsed.path == "/api/settings":
             self._send_json(200, {"settings": {**deepcopy(LLM_DEFAULTS), **load_trading_settings()}, "settingsPath": str(settings_path())})
             return
@@ -1296,7 +1396,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
     def _post(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path not in {"/api/settings", "/api/account/refresh", "/api/login", "/api/logout", "/api/control/run", "/api/control/pause", "/api/control/cancel-pending", "/api/positions/carry", "/api/positions/adopt"}:
+        if parsed.path not in {"/api/settings", "/api/account/refresh", "/api/login", "/api/logout", "/api/control/run", "/api/control/pause", "/api/control/cancel-pending", "/api/positions/carry", "/api/positions/adopt", "/api/research/run", "/api/research/stop", "/api/research/universe"}:
             self.send_error(404)
             return
         if parsed.path != "/api/login" and not self._authorized():
@@ -1312,7 +1412,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
         except ValueError:
             self._send_json(400, {"ok": False, "error": "Invalid Content-Length."})
             return
-        if length > 20_000:
+        if length > (150_000 if parsed.path == "/api/research/universe" else 20_000):
             self._send_json(413, {"ok": False, "error": "Settings payload is too large."})
             return
         try:
@@ -1324,6 +1424,27 @@ class MonitorHandler(BaseHTTPRequestHandler):
                 payload = {key: values[-1] for key, values in parsed_form.items()}
             if not isinstance(payload, dict):
                 raise ValueError("Settings payload must be an object.")
+            if parsed.path.startswith("/api/research/"):
+                research = getattr(self.server, "research", None)
+                if not isinstance(research, ResearchService):
+                    raise ValueError("중장기 탐색 실행기가 없습니다.")
+                try:
+                    if parsed.path.endswith("/stop"):
+                        state = research.stop(payload.get("requestId"))
+                    elif parsed.path.endswith("/universe"):
+                        state = research.register_universe(payload)
+                    else:
+                        control = getattr(self.server, "control", None)
+                        if isinstance(control, RunController):
+                            trading = control.snapshot()
+                            if trading.get("active") or trading.get("pending"):
+                                raise ResearchBusy("단타 분석/매매가 진행 중이거나 대기 중입니다. 완료 후 탐색을 실행하세요.")
+                        state = research.submit(payload, load_trading_settings())
+                except ResearchBusy as exc:
+                    self._send_json(409, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(202, {"ok": True, **state})
+                return
             if parsed.path in {"/api/positions/carry", "/api/positions/adopt"}:
                 risk = getattr(self.server, "risk", None)
                 if not isinstance(risk, PositionRiskManager):
@@ -1399,6 +1520,7 @@ def start_monitor_server(host: str, port: int, *, scenario: str = "auto-paper", 
                                secure_cookie=os.getenv("TRADINGAGENTS_WEB_SECURE_COOKIE", "").lower() in {"1", "true"})
     server.control = control
     server.risk = risk
+    server.research = ResearchService(LOCAL_DIR / "long_term", PROJECT_DIR)
     ensure_monitor_token()
     port = server.server_address[1]
     server.monitor_url = f"http://{access_host}:{port}"  # type: ignore[attr-defined]
@@ -2250,6 +2372,7 @@ async def _main_async(args: argparse.Namespace) -> int:
         if risk:
             await asyncio.to_thread(risk.stop)
         if monitor_server:
+            monitor_server.research.close()
             monitor_server.account_stop.set()
             monitor_server.shutdown()
             monitor_server.server_close()

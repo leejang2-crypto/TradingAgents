@@ -4,7 +4,7 @@
   const storageKey = 'tradingagents-dashboard-layout-v1';
   let saved = {};
   try { saved = JSON.parse(sessionStorage.getItem(storageKey) || '{}') || {}; } catch (_) {}
-  const views = ['overview', 'analysis', 'history', 'execution', 'settings'];
+  const views = ['overview', 'analysis', 'research', 'history', 'execution', 'settings'];
   let current = views.includes(saved.view) ? saved.view : 'overview';
   const scrolls = saved.scrolls && typeof saved.scrolls === 'object' ? saved.scrolls : {};
   const folds = saved.folds && typeof saved.folds === 'object' ? saved.folds : {};
@@ -59,6 +59,7 @@
   move('#positions-panel', 'overview');
   move('[data-live="analyses"]', 'analysis');
   move('[data-live="candidates"]', 'analysis');
+  move('#research-panel', 'research');
   move('#account-panel', 'history');
   const orders = document.createElement('section');
   orders.append(el('position-order-panel')); el('view-history').append(orders);
@@ -112,12 +113,47 @@
     if (dirty()) { event.preventDefault(); event.returnValue = ''; }
   });
   window.addEventListener('pagehide', () => { scrolls[current] = window.scrollY; persist(); });
+  const summaryDialog = el('summary-dialog');
+  let summaryRequest = null;
+  let summaryTrigger = null;
+  el('summary-close').addEventListener('click', () => summaryDialog.close());
+  summaryDialog.addEventListener('close', () => {
+    summaryRequest?.abort(); summaryRequest = null;
+    el('summary-content').textContent = '';
+    (summaryTrigger?.isConnected ? summaryTrigger : el('tab-analysis')).focus({preventScroll: true});
+  });
+  // Delegate clicks because polling replaces the analysis table and its link.
+  document.addEventListener('click', async event => {
+    const link = event.target.closest('a[data-summary-link]');
+    if (!link || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    summaryRequest?.abort();
+    const request = new AbortController(); summaryRequest = request; summaryTrigger = link;
+    el('summary-file').textContent = link.textContent;
+    el('summary-content').textContent = ''; el('summary-content').hidden = true;
+    el('summary-status').textContent = '불러오는 중...';
+    summaryDialog.showModal();
+    try {
+      const response = await fetch(link.href, {signal: request.signal, cache: 'no-store'});
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '분석 요약을 불러오지 못했습니다.');
+      if (summaryRequest !== request || !summaryDialog.open) return;
+      el('summary-content').textContent = JSON.stringify(data.content, null, 2);
+      el('summary-content').hidden = false;
+      el('summary-content').scrollTop = 0;
+      el('summary-status').textContent = '';
+    } catch (error) {
+      if (error.name !== 'AbortError' && summaryRequest === request && summaryDialog.open)
+        el('summary-status').textContent = error.message;
+    }
+  });
   const headerObserver = new ResizeObserver(() => {
     document.documentElement.style.setProperty('--dashboard-header-height', el('dashboard-header').offsetHeight + 'px');
   });
   headerObserver.observe(el('dashboard-header'));
 
   const tableConfigs = [
+    {key: 'research-results', root: '#research-results > .account-scroll', symbol: 0, outside: true},
     {key: 'recent-trades', root: '[data-live="trades"]', symbol: 1, date: 0},
     {key: 'position-orders', root: '#position-order-panel', symbol: 0},
     {key: 'account-orders', root: '#account-orders', symbol: 1, date: 0, outside: true},
