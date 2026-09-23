@@ -6,6 +6,7 @@ import pytest
 
 import main
 from tradingagents.brokers import toss_executor
+from tests.test_long_term_research import universe_snapshot
 
 
 @pytest.fixture
@@ -17,7 +18,10 @@ def live_args(monkeypatch, tmp_path):
 
 def test_live_and_paper_share_candidates_objective_and_analysis(live_args, monkeypatch):
     candidates = [{"ticker": "000660.KS"}, {"ticker": "035420.KS"}]
-    monkeypatch.setattr(main, "collect_candidate_snapshot", lambda args: {"ok": True, "candidates": candidates})
+    universe = universe_snapshot()
+    universe["members"].pop("000198.KS")
+    universe["members"]["035420.KS"] = "NAVER"
+    monkeypatch.setattr(main, "collect_candidate_snapshot", lambda args: {"ok": True, "universe": universe, "candidates": candidates})
     calls = []
 
     async def analyze(args, *, execute):

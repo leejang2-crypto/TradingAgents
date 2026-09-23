@@ -448,6 +448,27 @@ def _candidate_symbol_map() -> dict[str, str]:
     }
 
 
+def candidate_symbol_aliases(symbol_map: dict[str, str]) -> dict[str, set[str]]:
+    """Enrich names without adding any tickers outside the supplied universe."""
+    known: dict[str, set[str]] = {}
+    for code, name in _candidate_symbol_map().items():
+        known.setdefault(_base_symbol(code), set()).add(str(name))
+    result = {}
+    for code, name in symbol_map.items():
+        base = _base_symbol(code)
+        aliases = {base, str(name)} | known.get(base, set())
+        if any(alias.upper() == "NAVER" for alias in aliases):
+            aliases.add("네이버")
+        result[code] = {alias for alias in aliases if alias.strip()}
+    return result
+
+
+def _mentions_alias(text: str, alias: str) -> bool:
+    if alias.isascii():
+        return bool(re.search(r"(?<![A-Za-z0-9])" + re.escape(alias) + r"(?![A-Za-z0-9])", text, re.IGNORECASE))
+    return alias in text
+
+
 def collect_keyword_news_naver(
     query: str,
     start_date: str,
@@ -531,7 +552,8 @@ def rank_candidate_tickers(
     limit: int = 20,
 ) -> list[dict[str, Any]]:
     """Rank known Korean tickers mentioned in discovery news rows."""
-    candidates = symbol_map or _candidate_symbol_map()
+    candidates = _candidate_symbol_map() if symbol_map is None else symbol_map
+    aliases_by_symbol = candidate_symbol_aliases(candidates)
     scores: dict[str, dict[str, Any]] = {}
     for article in articles:
         text = f"{article.get('title', '')} {article.get('description', '')}"
@@ -539,12 +561,9 @@ def rank_candidate_tickers(
         weight = _CANDIDATE_CATEGORY_WEIGHTS.get(category, 1)
         for code, name in candidates.items():
             base = _base_symbol(code)
-            aliases = {base, str(name)}
-            if str(name).upper() == "NAVER":
-                aliases.add("네이버")
-            if not any(alias and alias in text for alias in aliases):
+            if not any(_mentions_alias(text, alias) for alias in aliases_by_symbol[code]):
                 continue
-            ticker = f"{base}.KS" if base.isdigit() else code
+            ticker = code.strip().upper() if "." in code else f"{base}.KS"
             row = scores.setdefault(
                 ticker,
                 {

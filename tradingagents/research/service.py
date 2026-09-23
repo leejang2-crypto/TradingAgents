@@ -112,7 +112,7 @@ class ResearchService:
             status = read(path, {})
             if status.get("status") == "running":
                 write_json(path, {"id": job_id, "status": "failed", "updatedAt": now(),
-                    "phase": "탐색 제한시간(60분) 초과" if timed_out else "탐색 프로세스 종료; 새 실행이 필요합니다."})
+                    "phase": f"탐색 제한시간({RESEARCH_TIMEOUT_SECONDS // 60}분) 초과" if timed_out else "탐색 프로세스 종료; 새 실행이 필요합니다."})
 
     def register_universe(self, payload):
         snapshot = import_csv(payload)

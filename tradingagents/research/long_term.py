@@ -10,7 +10,7 @@ import signal
 import sys
 
 from .quality import apply_quality, compare_peers, filters_from, statement_rows
-from .universe import INDEX_NAME, RESEARCH_TIMEOUT_SECONDS, UniverseError, resolve_universe, select_members
+from .universe import INDEX_NAME, MAX_MEMBER_COUNT, RESEARCH_TIMEOUT_SECONDS, TICKER_PATTERN, UniverseError, resolve_universe, select_members
 
 HORIZONS = {"1-3": "1~3개월", "3-12": "3~12개월", "12-36": "1~3년"}
 LEGACY_NAMES = {
@@ -60,11 +60,11 @@ def validate_request(payload, settings):
     if provider not in ("none", "openai", "ollama"):
         raise ValueError("지원하지 않는 탐색 LLM입니다.")
     raw = payload.get("tickers", "")
-    if not isinstance(raw, str) or len(raw) > 2000:
+    if not isinstance(raw, str) or len(raw) > 4000:
         raise ValueError("종목 입력이 너무 깁니다.")
     tickers = list(dict.fromkeys(re.split(r"[\s,]+", raw.strip().upper()))) if raw.strip() else []
-    if len(tickers) > 100 or any(not re.fullmatch(r"\d{6}\.KS", t) for t in tickers):
-        raise ValueError("코스피100 종목을 최대 100개, 005930.KS 형식으로 입력하세요. 비우면 전체 100종목입니다.")
+    if len(tickers) > MAX_MEMBER_COUNT or any(not re.fullmatch(TICKER_PATTERN, t) for t in tickers):
+        raise ValueError("코스피200 구성종목을 005930.KS 또는 0126Z0.KS 형식으로 입력하세요. 최대 201개이며 비우면 등록된 전체 목록입니다.")
     # Copy only model configuration, never trading settings or credentials.
     return {"id": request_id, "horizon": horizon, "provider": provider, "tickers": tickers, "universe": INDEX_NAME,
             "filters": filters_from(payload.get("filters")),
@@ -250,7 +250,7 @@ def run_research(config, *, fetch=load_market, review=review_candidates, progres
             "model": config["model"], "scope": tickers, "universe": universe, "rows": rows, "errors": errors,
             "shortlist": [row["ticker"] for row in shortlist], "llmStatus": llm_status,
             "questions": QUESTIONS, "readOnly": True, "scoringVersion": "long-term-v2", "filters": filters,
-            "limitations": [f"코스피100 구성목록 기준일 {universe['asOf']} · {universe['source']} · 분석 대상 {len(tickers)}종목입니다.",
+            "limitations": [f"코스피200 구성목록 기준일 {universe['asOf']} · {universe['source']} · 분석 대상 {len(tickers)}종목입니다.",
                 "점수는 임의의 탐색 기준 충족도이며 수익률 예측이나 매수 지시가 아닙니다.",
                 "누락 자료는 0점 처리하며 금융·부동산 업종은 별도 확인 대상으로 분리합니다.",
                 "종합 점수는 기존 점수 60% + 추가 검증 점수 40%. 추가 자료 충족률 70%와 설정 조건을 함께 확인합니다.",
@@ -268,7 +268,7 @@ def worker(directory):
     try:
         os.nice(10)
         signal.alarm(RESEARCH_TIMEOUT_SECONDS)
-        progress("코스피100 구성종목 확인")
+        progress("코스피200 구성종목 확인")
         cache_path = directory.parent / "universe.json"
         try:
             cached = json.loads(cache_path.read_text(encoding="utf-8"))

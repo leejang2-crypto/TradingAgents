@@ -14,8 +14,8 @@ from tradingagents.research.universe import today_korea
 
 def universe_snapshot():
     members = {"005930.KS": "삼성전자", "000660.KS": "SK하이닉스"}
-    members.update({f"{i:06}.KS": f"가상 종목 {i}" for i in range(1, 99)})
-    return {"index": "KOSPI100", "asOf": today_korea().isoformat(), "checkedOn": today_korea().isoformat(),
+    members.update({f"{i:06}.KS": f"가상 종목 {i}" for i in range(1, 199)})
+    return {"index": "KOSPI200", "asOf": today_korea().isoformat(), "checkedOn": today_korea().isoformat(),
             "source": "사용자 확인 KRX CSV", "members": members}
 
 
@@ -26,7 +26,7 @@ def market(**overrides):
             "mostRecentQuarter": datetime.now(timezone.utc).timestamp()}
     info.update(overrides)
     statements = {"income": {}, "cash": {}, "balance": {}}
-    today = date.today()
+    today = datetime.now(timezone.utc).date()
     quarter_month = today.year * 12 + ((today.month - 1) // 3) * 3 - 1
     for index in range(8):
         year, month = divmod(quarter_month - index * 3, 12)
@@ -34,7 +34,7 @@ def market(**overrides):
         statements["income"][day] = {"revenue": 180 - index * 10, "operatingIncome": (180 - index * 10) * (.2 - .005 * index), "netIncome": 10}
         statements["cash"][day] = {"operatingCashFlow": 20, "capex": -5, "freeCashFlow": 15}
         statements["balance"][day] = {"equity": 100, "currentAssets": 80, "currentLiabilities": 40, "shares": 100}
-    return {"info": info, "closes": list(range(1, 301)), "priceDate": date.today().isoformat(),
+    return {"info": info, "closes": list(range(1, 301)), "priceDate": today.isoformat(),
             "statements": statements, "averageTurnover20": 1_000_000_000, "splitDates": []}
 
 
@@ -85,7 +85,7 @@ def test_negative_values_do_not_count_as_cheap_or_safe():
 
 @pytest.mark.parametrize("change", [{"requestId": "../bad"}, {"tickers": "005930"}, {"tickers": "AAPL"},
     {"tickers": "005930.KS;rm"}, {"horizon": "daily"}, {"horizon": []}, {"provider": "hybrid"},
-    {"tickers": ["005930.KS"]}, {"tickers": "247540.KQ"}, {"tickers": ",".join(f"{n:06}.KS" for n in range(101))}])
+    {"tickers": ["005930.KS"]}, {"tickers": "247540.KQ"}, {"tickers": ",".join(f"{n:06}.KS" for n in range(202))}])
 def test_invalid_requests_rejected(change):
     with pytest.raises(ValueError):
         research.validate_request({"requestId": "a" * 32, **change}, {})
@@ -99,7 +99,7 @@ def test_configuration_is_independent_and_restricted_to_kospi():
     assert "secret" not in json.dumps(job) and "paper_capital" not in job
     assert settings == before
     automatic = research.validate_request({"requestId": "b" * 32}, {})
-    assert automatic["tickers"] == [] and automatic["universe"] == "KOSPI100"
+    assert automatic["tickers"] == [] and automatic["universe"] == "KOSPI200"
 
 
 def test_optional_llm_and_partial_failures_preserve_quantitative_results():

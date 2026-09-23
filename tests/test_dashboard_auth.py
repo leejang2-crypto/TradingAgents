@@ -114,14 +114,28 @@ def test_universe_upload_requires_auth_csrf_and_valid_csv(server, tmp_path):
     from tests.test_research_universe import csv_payload
     server.research = ResearchService(tmp_path / "long_term", main.PROJECT_DIR)
     path, payload = "/api/research/universe", csv_payload()
+    payload.update(fileName="kospi200.csv", asOf="2025-01-01")
     assert request(server, "POST", path, payload)[0] == 401
     cookie = login(server)
     assert request(server, "POST", path, payload, cookie=cookie, extra={"Origin": "https://evil.example"})[0] == 403
     original, settings = server.control.snapshot(), main.load_trading_settings()
     assert request(server, "POST", path, {**payload, "confirmed": False}, cookie=cookie)[0] == 400
     status, _, body = request(server, "POST", path, payload, cookie=cookie)
-    assert status == 202 and len(json.loads(body)["universe"]["members"]) == 100
+    assert status == 202 and len(json.loads(body)["universe"]["members"]) == 200
+    uploaded = json.loads(body)["universe"]
+    assert uploaded["fileName"] == "kospi200.csv" and uploaded["asOf"] == "2025-01-01"
+    assert uploaded["registeredAt"].endswith("+09:00")
     assert request(server, "POST", path, {**payload, "csv": "x" * 150001}, cookie=cookie)[0] == 413
+    from tests.krx_english_sample import english_sample
+    payload["csv"] = english_sample()
+    status, _, body = request(server, "POST", path, payload, cookie=cookie)
+    assert status == 400 and "201종목 원본 확인" in json.loads(body)["error"]
+    assert len(server.research.snapshot()["universe"]["members"]) == 200
+    payload["nonstandardCountConfirmed"] = True
+    status, _, body = request(server, "POST", path, payload, cookie=cookie)
+    snapshot = json.loads(body)["universe"]
+    assert status == 202 and snapshot["importInfo"]["rowCount"] == 201
+    assert snapshot["members"]["0126Z0.KS"] == "SAMSUNG EPIS HOLDINGS"
     assert server.control.snapshot() == original and main.load_trading_settings() == settings
 
 

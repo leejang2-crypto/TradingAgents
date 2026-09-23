@@ -2,6 +2,7 @@
   const el = id => document.getElementById(id);
   const labels = {running: '진행 중', completed: '완료', failed: '실패', stopped: '중단', interrupted: '종료됨'};
   const horizons = {'1-3': '1~3개월', '3-12': '3~12개월', '12-36': '1~3년'};
+  const indexLabel = universe => ({KOSPI100: '코스피100', KOSPI200: '코스피200'}[universe?.index] || '이전 사용자 지정 범위');
   const timestamp = value => value ? new Date(value).toLocaleString('ko-KR', {timeZone: 'Asia/Seoul', hour12: false}) : '-';
   const node = (tag, text) => { const item = document.createElement(tag); item.textContent = text; return item; };
   const headers = {'Content-Type': 'application/json', 'X-Requested-With': 'TradingAgents'};
@@ -16,9 +17,15 @@
   function render(data) {
     state = data; buttons();
     const universe = data.universe;
+    const uploaded = universe?.source === '사용자 확인 KRX CSV';
+    el('research-universe-file-info').textContent = uploaded
+      ? `파일명: ${universe.fileName || '미기록 (이전 등록 자료)'}\n조회 기준일: ${universe.asOf || '-'}\n등록 일시 (한국 시간): ${universe.registeredAt ? timestamp(universe.registeredAt) : (universe.checkedOn || '-') + ' (시각 미기록)'}` : '';
+    const imported = universe?.importInfo;
+    el('research-import-info').textContent = imported
+      ? `등록 성공 · ${imported.format} ${imported.rowCount}종목 · 앞자리 0 복원 ${imported.zeroPaddedCodes}건 · 영문 포함 코드 ${imported.alphanumericCodes}건${universe.nonstandardCountConfirmed && imported.rowCount === 201 ? ' · 201종목 원본 확인됨' : ''}` : '';
     el('research-universe-state').textContent = universe?.members
-      ? `코스피100 · ${Object.keys(universe.members).length}종목 · 기준일 ${universe.asOf} · 확인일 ${universe.checkedOn} · ${universe.source}`
-      : '코스피100 구성목록 미등록 · 자동 조회 실패 시 KRX CSV 필요';
+      ? `${indexLabel(universe)} · ${Object.keys(universe.members).length}종목 · 기준일 ${universe.asOf} · 확인일 ${universe.checkedOn} · ${universe.source}${universe.index !== 'KOSPI200' ? ' · 새 분석에는 코스피200 구성목록 등록 필요' : uploaded ? ' · 다음 CSV 등록 전까지 계속 사용' : ''}`
+      : '코스피200 구성목록 미등록 · 자동 조회 실패 시 KRX CSV 필요';
     const status = data.active || data.status;
     el('research-state').textContent = !data.available ? '중장기 탐색 실행기 없음' : status?.id
       ? `${labels[status.status] || status.status} · ${status.phase || ''} · ${timestamp(status.updatedAt)}` : '탐색 기록 없음';
@@ -40,7 +47,7 @@
     if (key === reportKey) return;
     reportKey = key; el('research-results').hidden = !report;
     if (!report) return;
-    el('research-meta').textContent = `${timestamp(report.createdAt)} · ${horizons[report.horizon]} · ${report.universe ? '코스피100 (구성 기준일 ' + report.universe.asOf + ')' : '이전 사용자 지정 범위'} · 조회 ${report.scope.length}종목 · 기준 통과 ${report.rows.filter(row => row.eligible).length}종목 · 상위 후보 ${report.shortlist.length}종목 · ${report.scoringVersion}`;
+    el('research-meta').textContent = `${timestamp(report.createdAt)} · ${horizons[report.horizon]} · ${indexLabel(report.universe)}${report.universe ? ' (구성 기준일 ' + report.universe.asOf + ')' : ''} · 조회 ${report.scope.length}종목 · 기준 통과 ${report.rows.filter(row => row.eligible).length}종목 · 상위 후보 ${report.shortlist.length}종목 · ${report.scoringVersion}`;
     el('research-llm').textContent = `LLM: ${report.provider}${report.model ? ' / ' + report.model : ''} · ${report.llmStatus}`;
     const f = report.filters;
     el('research-filter-summary').textContent = f ? `저장 조건: PER ≤ ${f.max_pe} · 매출 YoY > ${f.min_revenue_growth_pct}% · 부채비율 ≤ ${f.max_debt_equity}% · 낙폭 ≤ ${f.max_drawdown_pct}% · 주식 수 증가 ≤ ${f.max_dilution_pct}% · 거래대금 ≥ ${numeric(f.min_turnover_krw)} KRW · 검증 점수 ≥ ${f.min_quality_score}` : '이전 버전 결과: 추가 검증 기준 미적용';
@@ -141,7 +148,8 @@
       let csv;
       try { csv = new TextDecoder('utf-8', {fatal: true}).decode(bytes); }
       catch (_) { csv = new TextDecoder('euc-kr', {fatal: true}).decode(bytes); }
-      await command('universe', {csv, asOf: form.get('asOf'), confirmed: form.get('confirmed') === 'on'});
+      await command('universe', {csv, fileName: file.name, asOf: form.get('asOf'), confirmed: form.get('confirmed') === 'on',
+        nonstandardCountConfirmed: form.get('nonstandardCountConfirmed') === 'on'});
     } catch (error) { el('research-error').textContent = error.message; }
   });
   el('research-stop').addEventListener('click', () => {

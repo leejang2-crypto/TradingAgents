@@ -35,6 +35,7 @@ from tradingagents.brokers.toss_executor import execute_plan, plan_from_decision
 from tradingagents.brokers.account_service import account_view, refresh_account
 from tradingagents.agents.utils.experience import ExperienceStore
 from tradingagents.dataflows.naver_news import (
+    candidate_symbol_aliases,
     collect_candidate_news_naver,
     collect_news_naver,
     rank_candidate_tickers,
@@ -48,6 +49,7 @@ from tradingagents.monitoring.control import BusyError, RunController, RunStoppe
 from tradingagents.brokers.position_risk import PositionRiskManager, RISK_DEFAULTS
 from tradingagents.brokers.intraday import INTRADAY_DEFAULTS, DECIMAL_LIMITS, INTEGER_LIMITS
 from tradingagents.research.service import ResearchBusy, ResearchService
+from tradingagents.research.universe import UniverseError, validate_snapshot as validate_universe
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -791,6 +793,11 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
     runtime = snapshot.get("runtime") or {}
     summary = snapshot.get("latestSummary") if isinstance(snapshot.get("latestSummary"), dict) else {}
     candidates = snapshot.get("latestCandidates") if isinstance(snapshot.get("latestCandidates"), dict) else {}
+    candidate_universe = candidates.get("universe") or {}
+    candidate_scope = (
+        f"코스피200 · {len(candidate_universe.get('members', {}))}종목 · 기준일 {candidate_universe.get('asOf')} · {candidate_universe.get('source')}"
+        if candidate_universe.get("index") == "KOSPI200" else "구성목록 정보 없음 (이전 결과 또는 등록 필요)"
+    )
     settings = snapshot.get("settings") if isinstance(snapshot.get("settings"), dict) else {}
     settings = {**LLM_DEFAULTS, **INTRADAY_DEFAULTS, **settings}
 
@@ -1035,13 +1042,16 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
     <section id="research-panel">
       <h2>중장기 종목 탐색</h2>
       <p class="muted">연구 전용 · 자동 주문/보유 편입 없음 · 점수는 예상 수익률이 아닙니다.</p>
-      <p id="research-universe-state" role="status">코스피100 구성목록 확인 전</p>
-      <details><summary>KRX 코스피100 구성목록 등록</summary>
+      <p id="research-universe-state" role="status">코스피200 구성목록 확인 전</p>
+      <p id="research-universe-file-info" style="white-space: pre-line; overflow-wrap: anywhere"></p>
+      <p id="research-import-info" role="status"></p>
+      <details><summary>KRX 코스피200 구성목록 등록</summary>
         <p><a href="https://data.krx.co.kr/contents/MDC/MAIN/main/index.cmd" target="_blank" rel="noopener noreferrer">KRX 데이터 시스템</a></p>
         <form id="research-universe-form">
-          <div class="form-grid"><label>구성종목 CSV<input id="research-universe-file" type="file" accept=".csv,text/csv" required></label>
+          <div class="form-grid"><label>구성종목 CSV/TSV<input id="research-universe-file" type="file" accept=".csv,.tsv,text/csv,text/tab-separated-values" required></label>
           <label>CSV 조회 기준일<input name="asOf" type="date" max="{today_korea().isoformat()}" required></label></div>
-          <label class="control-check"><input name="confirmed" type="checkbox" required>KRX에서 조회한 코스피100 전체 100종목 CSV임을 확인합니다.</label>
+          <label class="control-check"><input name="confirmed" type="checkbox" required>KRX에서 조회한 코스피200 전체 구성목록임을 확인합니다.</label>
+          <label class="control-check"><input name="nonstandardCountConfirmed" type="checkbox">201종목 원본 확인: KRX 원본의 전체 구성종목 수가 201개입니다.</label>
           <button type="submit" id="research-universe-save">구성목록 등록</button>
         </form>
       </details>
@@ -1050,7 +1060,7 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
           <label>보유 관점<select name="research_horizon"><option value="1-3">1~3개월</option><option value="3-12" selected>3~12개월</option><option value="12-36">1~3년</option></select></label>
           <label>근거 검토 LLM<select name="research_provider"><option value="none">정량 탐색만 (LLM 미사용)</option><option value="openai">OpenAI · API 비용 발생</option><option value="ollama">Ollama · 로컬 자원 사용</option></select></label>
         </div>
-        <label>코스피100 내 분석 종목 (비우면 전체 100종목)<textarea name="research_tickers" maxlength="2000" placeholder="005930.KS, 000660.KS"></textarea></label>
+        <label>코스피200 내 분석 종목 (비우면 등록된 전체 종목)<textarea name="research_tickers" maxlength="4000" placeholder="005930.KS, 000660.KS, 0126Z0.KS"></textarea></label>
         <details><summary>중장기 선별 조건</summary><div class="form-grid">
           <label>후행 PER 상한 (배)<input name="research_max_pe" type="number" min="1" max="200" step="any" value="25" required></label>
           <label>분기 매출 YoY 하한 초과 (%)<input name="research_min_revenue_growth_pct" type="number" min="-50" max="100" step="any" value="5" required></label>
@@ -1248,6 +1258,9 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
     </section>
     <section data-live="candidates">
       <h2>Candidate Ranking</h2>
+      <p>{_compact_text(candidate_scope)}</p>
+      <p role="status">{_compact_text(candidates.get('selectionReason') or candidates.get('error'), '')}</p>
+      {''.join('<p class="muted">' + _compact_text(warning) + '</p>' for warning in (candidates.get('warnings') or []))}
       <table><thead><tr><th>Ticker</th><th>Name</th><th>Score</th><th>Mentions</th><th>Positive</th><th>Risk</th></tr></thead>
       <tbody>{''.join(candidate_rows) or '<tr><td colspan="6">No candidates yet</td></tr>'}</tbody></table>
       <details data-detail-key="candidate-path"><summary>후보 파일 경로</summary><p><code>{_compact_text(snapshot.get("latestCandidatePath"))}</code></p></details>
@@ -1738,6 +1751,15 @@ def collect_korea_news_snapshot(args: argparse.Namespace) -> dict[str, Any] | No
     }
 
 
+def load_intraday_universe() -> dict[str, Any]:
+    path = LOCAL_DIR / "long_term" / "universe.json"
+    try:
+        snapshot = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise UniverseError("단타 후보용 코스피200 목록이 없습니다. 중장기 탭에서 KRX 전체 구성목록을 등록하세요.") from None
+    return validate_universe(snapshot)
+
+
 def collect_candidate_snapshot(args: argparse.Namespace) -> dict[str, Any]:
     start_date = (
         datetime.strptime(args.date, "%Y-%m-%d") - timedelta(days=args.candidate_days)
@@ -1747,7 +1769,14 @@ def collect_candidate_snapshot(args: argparse.Namespace) -> dict[str, Any]:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     prefix = auto_scenario(args).replace("-", "_")
     output_prefix = LOCAL_DIR / "candidates" / f"{prefix}_candidates_{args.date}_{stamp}"
+    universe = None
+    warnings = []
     try:
+        universe = load_intraday_universe()
+        aliases = candidate_symbol_aliases(universe["members"])
+        korean_name_count = sum(any(re.search(r"[가-힣]", name) for name in names) for names in aliases.values())
+        if korean_name_count < len(aliases):
+            warnings.append(f"한글명/별칭이 없는 {len(aliases) - korean_name_count}종목은 코드·등록명으로만 뉴스를 인식합니다. 한글 KRX 목록을 사용하면 한글 기사 인식 범위를 넓힐 수 있습니다.")
         articles = collect_candidate_news_naver(
             start_date,
             args.date,
@@ -1756,13 +1785,13 @@ def collect_candidate_snapshot(args: argparse.Namespace) -> dict[str, Any]:
             sort="date",
             extra_queries=extra_queries,
         )
-        candidates = rank_candidate_tickers(articles, limit=args.candidate_limit)
+        candidates = rank_candidate_tickers(articles, symbol_map=universe["members"], limit=args.candidate_limit)
         ok = True
         error = None
+    except RunStopped:
+        raise
     except Exception as exc:
-        # Candidate discovery is useful but non-critical. A Naver rate limit or
-        # transient API failure should not stop paper trading; the caller will
-        # fall back to --korea-ticker and continue with vendor fallback enabled.
+        # Discovery failure blocks new entries, not the independent holding monitor.
         articles = []
         candidates = []
         ok = False
@@ -1773,6 +1802,9 @@ def collect_candidate_snapshot(args: argparse.Namespace) -> dict[str, Any]:
         "purpose": f"TradingAgents {auto_scenario(args)} candidate discovery",
         "ok": ok,
         "error": error,
+        "universe": universe,
+        "warnings": warnings,
+        "selectionReason": error or ("코스피200 뉴스 후보 없음; 신규 후보 분석/주문 생략" if not candidates else None),
         "startDate": start_date,
         "endDate": args.date,
         "categories": categories,
@@ -1798,6 +1830,10 @@ def collect_candidate_snapshot(args: argparse.Namespace) -> dict[str, Any]:
         f"- Trading style: {args.trading_style}",
         f"- Article count: {len(articles)}",
         f"- Candidate count: {len(candidates)}",
+        f"- Universe: KOSPI200 / {len(universe['members']) if universe else 0} constituents",
+        f"- Universe as of: {universe['asOf'] if universe else 'unavailable'}",
+        f"- Selection status: {payload['selectionReason'] or 'ranked'}",
+        *[f"- Warning: {warning}" for warning in warnings],
         "",
         "| Rank | Ticker | Name | Score | Mentions | Positive | Risk |",
         "|---:|---|---|---:|---:|---:|---:|",
@@ -1811,6 +1847,9 @@ def collect_candidate_snapshot(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "ok": ok,
         "error": error,
+        "universe": universe,
+        "warnings": warnings,
+        "selectionReason": payload["selectionReason"],
         "startDate": start_date,
         "endDate": args.date,
         "articleCount": len(articles),
@@ -2002,11 +2041,23 @@ async def run_auto_trading(args: argparse.Namespace, *, execute: bool) -> dict[s
     quick_model, deep_model, backend_url = resolve_models(args)
     candidate_snapshot = collect_candidate_snapshot(args)
     checkpoint("candidates-collected")
-    candidates = candidate_snapshot.get("candidates", [])
+    selection_ok = candidate_snapshot.get("ok") is True
+    selection_reason = candidate_snapshot.get("selectionReason") or candidate_snapshot.get("error")
+    if not selection_ok and not selection_reason:
+        selection_reason = "단타 후보 수집 실패; 신규 후보 분석/주문 생략"
+    candidates = []
+    if selection_ok:
+        try:
+            universe = validate_universe(candidate_snapshot.get("universe"))
+            candidates = candidate_snapshot.get("candidates", [])
+            if any(row["ticker"] not in universe["members"] for row in candidates):
+                raise UniverseError("코스피200 구성목록 밖의 후보가 포함되어 신규 분석/주문을 차단했습니다.")
+        except (ValueError, KeyError, TypeError) as exc:
+            selection_ok, selection_reason, candidates = False, str(exc), []
     candidate_names = {row["ticker"]: row.get("name") for row in candidates}
     tickers = [row["ticker"] for row in candidates[: max(args.trade_candidates, 0)]]
-    if not tickers and args.trade_candidates != 0:
-        tickers = [args.korea_ticker]
+    if not tickers and not selection_reason:
+        selection_reason = "분석 종목 수가 0으로 설정됨" if args.trade_candidates == 0 else "코스피200 뉴스 후보 없음; 신규 후보 분석/주문 생략"
 
     analyses: list[dict[str, Any]] = []
     original_ticker = args.korea_ticker
@@ -2044,7 +2095,8 @@ async def run_auto_trading(args: argparse.Namespace, *, execute: bool) -> dict[s
         args.korea_ticker = original_ticker
 
     summary = {
-        "ok": all(row.get("ok", True) for row in analyses) and len(analyses) == len(tickers),
+        "ok": selection_ok and all(row.get("ok", True) for row in analyses) and len(analyses) == len(tickers),
+        "selectionReason": selection_reason,
         "scenario": scenario,
         "executionMode": "live" if execute else "dry-run",
         "date": args.date,

@@ -9,6 +9,7 @@ from decimal import Decimal
 
 import main
 import pytest
+from tests.test_long_term_research import universe_snapshot
 
 
 def test_latest_analyses_show_saved_names_and_ticker_matched_fallback():
@@ -42,7 +43,8 @@ def test_latest_analyses_empty_row_spans_name_column():
 def test_auto_trading_persists_candidate_name_even_on_error(monkeypatch, tmp_path, fails):
     monkeypatch.setattr(main, "LOCAL_DIR", tmp_path)
     monkeypatch.setattr(main, "collect_candidate_snapshot", lambda args: {
-        "candidates": [{"ticker": "005930", "name": "삼성전자"}],
+        "ok": True, "universe": universe_snapshot(),
+        "candidates": [{"ticker": "005930.KS", "name": "삼성전자"}],
     })
 
     async def analyze(args, *, execute):
@@ -74,6 +76,7 @@ def test_collect_candidate_snapshot_degrades_on_discovery_error(monkeypatch, tmp
 
     monkeypatch.setattr(main, "LOCAL_DIR", tmp_path)
     monkeypatch.setattr(main, "collect_candidate_news_naver", boom)
+    monkeypatch.setattr(main, "load_intraday_universe", universe_snapshot)
 
     args = argparse.Namespace(
         date="2026-07-13",
