@@ -93,6 +93,18 @@ def get_trading_objective_instruction() -> str:
     ]
     if risk_note:
         parts.append(f"- Risk discipline: {risk_note}")
+    account = get_config().get("account_context")
+    if isinstance(account, Mapping) and account.get("mode") == "dry-run":
+        parts.extend([
+            "**Observed Paper Account (not a hypothetical starting balance):**",
+            f"- Snapshot time: {account.get('asOf')}; symbol: {account.get('symbol')}",
+            f"- Available cash: {account.get('cash')} KRW; total held symbols: {account.get('positionCount')}",
+            f"- Shares held in this symbol: {account.get('heldQuantity')}; average cost: {account.get('averageCost')}",
+            "- Cash-only, no short selling or additional buying of an already held symbol.",
+            "- With no shares held, a bearish view means HOLD/avoid entry, not a SELL order.",
+            "- SELL closes the managed holding. BUY must fit available cash including costs.",
+            "- Execution rechecks the account after analysis; this snapshot is not an order authorization.",
+        ])
     return "\n".join(parts)
 
 
@@ -243,4 +255,3 @@ def create_msg_delete():
         return {"messages": removal_operations + [placeholder]}
 
     return delete_messages
-

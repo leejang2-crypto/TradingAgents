@@ -32,7 +32,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
 
 from tradingagents.brokers.toss_executor import execute_plan, plan_from_decision
-from tradingagents.brokers.account_service import account_view, refresh_account
+from tradingagents.brokers.account_service import account_view, refresh_account, paper_account, paper_history
 from tradingagents.agents.utils.experience import ExperienceStore
 from tradingagents.dataflows.naver_news import (
     candidate_symbol_aliases,
@@ -778,7 +778,7 @@ def build_monitor_snapshot() -> dict[str, Any]:
         "latestSummary": latest_summary,
         "latestCandidatePath": str(latest_candidate_path) if latest_candidate_path else None,
         "latestCandidates": latest_candidates,
-        "recentTrades": trades,
+        "recentTrades": paper_history(LOCAL_DIR, trades),
         "recentLiveOrders": read_tail_jsonl(LOCAL_DIR / "live_orders" / "orders.jsonl", limit=30),
     }
 
@@ -855,6 +855,15 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
     trade_rows = []
     for trade in reversed(snapshot.get("recentLiveOrders" if live else "recentTrades") or []):
         plan = trade.get("plan") or {}
+        fill = (trade.get("simulation") or {}) if not live else {}
+        if live:
+            status = str(trade.get("status")) + (' (체결 미검증)' if not trade.get('fillVerified') else '')
+        elif trade.get("ledgerBacked"):
+            status = "가상 체결 · 계좌 반영" if fill.get("status") == "SIMULATED_FILLED" else "모의 주문 거절 · 체결 없음"
+            if fill.get("reason"):
+                status += " · " + str(fill["reason"])
+        else:
+            status = "주문 계획만 기록 · 계좌 미반영"
         trade_rows.append(
             "<tr>"
             f"<td>{_compact_text(trade.get('recordedAt'))}</td>"
@@ -862,7 +871,9 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
             f"<td>{_compact_text(plan.get('action'))}</td>"
             f"<td>{_compact_text(plan.get('order_amount') or plan.get('quantity'))}</td>"
             f"<td>{_compact_text(plan.get('rating'))}</td>"
-            f"<td>{_compact_text(trade.get('status'))}{' (가상 체결)' if trade.get('status') == 'SIMULATED_FILLED' else ' (체결 미검증)' if not trade.get('fillVerified') else ''}</td>"
+            f"<td>{_compact_text(status)}</td>"
+            + ("" if live else f"<td>{_compact_text(fill.get('quantity'))}</td><td>{_compact_text(fill.get('price'))}</td>"
+               f"<td>{_compact_text(fill.get('cashAfter'))}</td><td>{_compact_text(fill.get('quantityAfter'))}</td>") +
             "</tr>"
         )
     candidate_names = {
@@ -1267,8 +1278,8 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
     </section>
     <section data-live="trades">
       <h2>{'Recent Live Orders' if live else 'Recent Paper Trades'}</h2>
-      <table><thead><tr><th>Time</th><th>Symbol</th><th>Action</th><th>Amount/Qty</th><th>Rating</th><th>기록 상태</th></tr></thead>
-      <tbody>{''.join(trade_rows) or '<tr><td colspan="6">No paper trades yet</td></tr>'}</tbody></table>
+      <table><thead><tr><th>Time</th><th>Symbol</th><th>Action</th><th>주문 금액/수량</th><th>Rating</th><th>기록 상태</th>{'' if live else '<th>체결 수량</th><th>체결가</th><th>처리 후 현금</th><th>처리 후 보유 수량</th>'}</tr></thead>
+      <tbody>{''.join(trade_rows) or '<tr><td colspan="' + ('6' if live else '10') + '">No paper trades yet</td></tr>'}</tbody></table>
     </section>
   </main>
 </body>
@@ -1923,6 +1934,8 @@ async def run_korea_toss(args: argparse.Namespace, *, execute: bool) -> dict[str
         args, korea_mode=True, minimal_mode=False, collected_news_path=collected_news_path,
     )
     mode = "live" if execute else "dry-run"
+    if not execute and args.date == today_korea().isoformat():
+        config["account_context"] = paper_account(LOCAL_DIR, args.paper_capital).trading_context(args.korea_ticker.split(".")[0])
     store = ExperienceStore(LOCAL_DIR / "learning" / "experiences.sqlite3")
     run_id = store.start(
         mode=mode, ticker=args.korea_ticker, trade_date=args.date,
@@ -1984,6 +1997,7 @@ async def run_korea_toss(args: argparse.Namespace, *, execute: bool) -> dict[str
     except BaseException as exc:
         store.event(run_id, "INTERRUPTED" if isinstance(exc, RunStopped) or not isinstance(exc, Exception) else "ERROR", {
             "stage": stage, "error": str(exc), "errorType": type(exc).__name__,
+            "newsExecution": getattr(exc, "news_execution", None),
             "fillVerified": False, "realizedPnl": None,
         })
         raise
@@ -2000,6 +2014,8 @@ async def run_korea_toss(args: argparse.Namespace, *, execute: bool) -> dict[str
         "decision": decision,
         "reportPath": str(report_path),
         "collectedNews": collected_news,
+        "newsExecution": final_state.get("news_execution"),
+        "accountContext": config.get("account_context"),
         "toss": execution,
         "learning": {"enabled": True, "kind": "experience-retrieval", "runId": run_id, "database": str(store.path)},
     }
@@ -2088,6 +2104,7 @@ async def run_auto_trading(args: argparse.Namespace, *, execute: bool) -> dict[s
                     "candidateRank": candidate_rank,
                     "ok": False,
                     "error": str(exc),
+                    "newsExecution": getattr(exc, "news_execution", None),
                 }
             result["name"] = result.get("name") or candidate_names.get(ticker)
             analyses.append(result)

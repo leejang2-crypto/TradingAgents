@@ -116,6 +116,11 @@ class BrokerBackend:
     def sellable(self, symbol):
         return number(self.call("get_sellable_quantity", symbol)["sellableQuantity"]) if self.live else self.holdings().get(symbol, Decimal(0))
 
+    def affordable_quantity(self, price):
+        if self.live:
+            raise ValueError("Paper buying power requested for live account")
+        return paper_account(self.local_dir, self.capital).affordable_quantity(price)
+
     def submit(self, payload, now, *, valid_until=None):
         from tradingagents.monitoring.control import checkpoint
         if self.live:
@@ -134,7 +139,8 @@ class BrokerBackend:
         checkpoint("paper-fill")
         if valid_until and self.clock() >= valid_until:
             raise OrderWindowClosed("모의 체결 전 주문 제한 시간이 지났습니다.")
-        fill = paper_account(self.local_dir, self.capital).fill(plan, prices.get(plan.symbol), payload["clientOrderId"], now=self.clock())
+        fill = paper_account(self.local_dir, self.capital).fill(plan, prices.get(plan.symbol), payload["clientOrderId"],
+                                                              now=self.clock(), limit_price=payload.get("price"))
         record_paper_trade(plan, payload, simulation=fill, log_path=self.local_dir / "paper_trades/trades.jsonl")
         return {"orderId": payload["clientOrderId"], "paperFill": fill}
 
@@ -225,7 +231,7 @@ class PositionRiskManager:
         return day2 if position.get("carryApproved") else acquired
 
     def _import(self, state):
-        if state.get("historyImported"):
+        if self.live and state.get("historyImported"):
             return
         if self.live:
             path = self.local_dir / "live_orders/orders.jsonl"
@@ -239,8 +245,14 @@ class PositionRiskManager:
                 rows = [json.loads(row["payload"]) for row in db.execute("SELECT payload FROM fills ORDER BY recorded_at,rowid")]
             imported = deepcopy(state)
             for fill in rows:
-                payload = {"clientOrderId": fill["id"], "symbol": fill["symbol"], "side": fill["side"]}
-                record = {"payload": payload, "orderId": fill["id"], "status": "PENDING", "createdAt": fill["recordedAt"], "appliedQty": "0", "appliedCash": "0"}
+                record = imported["orders"].get(fill["id"])
+                if record and record["status"] in TERMINAL and not record.get("financialsIncomplete"):
+                    continue
+                if record is None:
+                    payload = {"clientOrderId": fill["id"], "symbol": fill["symbol"], "side": fill["side"]}
+                    record = {"payload": payload, "orderId": fill["id"], "status": "PENDING", "createdAt": fill["recordedAt"], "appliedQty": "0", "appliedCash": "0"}
+                # A committed paper fill also recovers a lost local acknowledgement.
+                record["orderId"] = fill["id"]
                 imported["orders"][fill["id"]] = record
                 self._apply_detail(imported, record, self.backend.detail(record))
             state.update(imported)
@@ -635,6 +647,8 @@ class PositionRiskManager:
                     raise ValueError("매수 제한 시간, 일일 손실 제한 또는 평가자료 부족으로 신규 매수를 차단했습니다.")
                 if number(position.get("quantity", 0)) > 0:
                     raise ValueError("보유 종목 추가 매수 금지")
+                if not self.live and self.backend.holdings().get(symbol, Decimal(0)) > 0:
+                    raise ValueError("모의계좌 보유 종목 추가 매수 금지")
                 if position.get("closedAt") and iso_time(position["closedAt"]).date() == now.date():
                     raise ValueError("당일 청산 종목 재진입 금지")
                 settings = {**INTRADAY_DEFAULTS, **self.settings()}
@@ -648,8 +662,10 @@ class PositionRiskManager:
                     if signal["symbol"] != symbol or not 0 <= (self.clock() - iso_time(signal["at"])).total_seconds() <= 30:
                         raise ValueError("진입 신호 유효기간 초과")
                     qty = size_entry(plan, signal, {**settings, **self._remaining_limits(state, settings)})
+                    if not self.live:
+                        qty = min(qty, self.backend.affordable_quantity(signal["ask"]))
                     if qty <= 0:
-                        raise ValueError("위험/투자금 한도로 1주도 매수할 수 없음")
+                        raise ValueError("현금 잔고/위험/투자금 한도로 1주도 매수할 수 없음")
                 except Exception as exc:
                     self._event(state, "entry-blocked", symbol=symbol, reason=str(exc))
                     state.setdefault("entryChecks", {})[symbol] = {"allowed": False, "at": self.clock().isoformat(), "reasons": [str(exc)]}

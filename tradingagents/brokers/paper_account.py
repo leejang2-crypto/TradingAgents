@@ -108,6 +108,25 @@ class PaperAccount:
         with self.connect() as db:
             return [r["symbol"] for r in db.execute("SELECT * FROM positions") if number(r["quantity"]) > 0]
 
+    def trading_context(self, symbol, now=None):
+        with self.connect() as db:
+            view = self._snapshot(db, now or now_kst(), persist=False)
+        position = next((p for p in view["positions"] if p["symbol"] == symbol), {})
+        return {"mode": "dry-run", "asOf": view.get("asOf"), "symbol": symbol,
+                "cash": view["cash"], "heldQuantity": position.get("quantity", "0"),
+                "averageCost": position.get("averagePrice"), "positionCount": len(view["positions"]),
+                "assumptions": view.get("assumptions", {})}
+
+    def affordable_quantity(self, price):
+        price = number(price)
+        if price <= 0:
+            raise ValueError("Invalid order price")
+        with self.connect() as db:
+            row = db.execute("SELECT cash,fee_rate FROM account WHERE id=1").fetchone()
+        if row is None:
+            raise ValueError("Paper account is not initialized")
+        return (number(row["cash"]) / (price * (1 + number(row["fee_rate"])))).to_integral_value(rounding=ROUND_DOWN)
+
     def _store_quotes(self, db, quotes):
         for symbol, quote in quotes.items():
             if quote.get("symbol") != symbol or quote.get("currency") != "KRW":
@@ -189,7 +208,7 @@ class PaperAccount:
             result["trades"] = [json.loads(r["payload"]) for r in db.execute("SELECT payload FROM fills ORDER BY recorded_at DESC LIMIT 100")]
             return result
 
-    def fill(self, plan, quote, execution_id, now=None):
+    def fill(self, plan, quote, execution_id, now=None, *, limit_price=None):
         now = now or now_kst()
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -204,12 +223,20 @@ class PaperAccount:
             try:
                 if plan.action not in {"BUY", "SELL"} or not re.fullmatch(r"[A-Z0-9]{6}", plan.symbol):
                     raise ValueError("Paper fills support Korean BUY/SELL orders only")
-                price = checked_quote(quote, plan.symbol, now)
+                price = checked_quote(quote, plan.symbol, now, max_age=120)
                 fee_rate, tax_rate, slip = (number(account[k]) for k in ("fee_rate", "tax_rate", "slippage"))
                 price *= 1 + slip if plan.action == "BUY" else 1 - slip
+                if plan.order_type == "LIMIT":
+                    limit = number(limit_price)
+                    if limit <= 0 or (plan.action == "BUY" and price > limit) or (plan.action == "SELL" and price < limit):
+                        raise ValueError("Simulated price does not satisfy order limit")
+                elif plan.order_type != "MARKET":
+                    raise ValueError("Unsupported paper order type")
                 cash = number(account["cash"])
                 existing = db.execute("SELECT * FROM positions WHERE symbol=?", (plan.symbol,)).fetchone()
                 held, cost = (number(existing[k]) for k in ("quantity", "cost")) if existing else (Decimal(0), Decimal(0))
+                result.update(cashBefore=money(cash), quantityBefore=str(held),
+                              cashAfter=money(cash), quantityAfter=str(held))
                 if plan.quantity is not None:
                     qty = number(plan.quantity)
                 elif plan.action == "BUY" and plan.order_amount:
@@ -238,7 +265,8 @@ class PaperAccount:
                 db.execute("INSERT OR REPLACE INTO positions VALUES(?,?,?)", (plan.symbol, str(new_qty), money(new_cost)))
                 result.update({"status": "SIMULATED_FILLED", "quantity": str(qty), "price": str(price),
                     "fee": money(fee), "tax": money(tax), "realizedPnl": money(realized),
-                    "cashAfter": money(new_cash), "quoteTime": quote["timestamp"], "priceSource": quote.get("source")})
+                    "grossAmount": money(gross), "cashAfter": money(new_cash), "quantityAfter": str(new_qty),
+                    "quoteTime": quote["timestamp"], "priceSource": quote.get("source")})
                 self._snapshot(db, now)
             except (ValueError, KeyError, TypeError) as exc:
                 result["reason"] = str(exc)

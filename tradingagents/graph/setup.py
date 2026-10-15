@@ -52,6 +52,7 @@ class GraphSetup:
         tool_nodes: dict[str, ToolNode],
         conditional_logic: ConditionalLogic,
         agent_llms: dict[str, Any] | None = None,
+        news_fallback_llm: Any = None,
     ):
         """Initialize with required components."""
         self.quick_thinking_llm = quick_thinking_llm
@@ -59,6 +60,7 @@ class GraphSetup:
         self.tool_nodes = tool_nodes
         self.conditional_logic = conditional_logic
         self.agent_llms = agent_llms or {}
+        self.news_fallback_llm = news_fallback_llm
 
     def _llm(self, agent_name: str, default: Any = None) -> Any:
         return self.agent_llms.get(agent_name, default or self.quick_thinking_llm)
@@ -80,7 +82,7 @@ class GraphSetup:
         analyst_factories = {
             "market": lambda: create_market_analyst(self._llm("market_analyst")),
             "social": lambda: create_sentiment_analyst(self._llm("sentiment_analyst")),
-            "news": lambda: create_news_analyst(self._llm("news_analyst")),
+            "news": lambda: create_news_analyst(self._llm("news_analyst"), fallback_llm=self.news_fallback_llm),
             "fundamentals": lambda: create_fundamentals_analyst(self._llm("fundamentals_analyst")),
         }
 

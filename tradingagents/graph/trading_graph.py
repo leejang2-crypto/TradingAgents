@@ -126,6 +126,9 @@ class TradingAgentsGraph:
             self.tool_nodes,
             self.conditional_logic,
             agent_llms=self.agent_llms,
+            news_fallback_llm=(self.quick_thinking_llm if self.config.get("llm_provider") == "hybrid"
+                and self.config.get("hybrid_agent_providers", {}).get("news_analyst") == "ollama"
+                and self.config.get("news_openai_fallback", True) else None),
         )
 
         self.propagator = Propagator(
@@ -631,6 +634,7 @@ class TradingAgentsGraph:
             "market_report": final_state["market_report"],
             "sentiment_report": final_state["sentiment_report"],
             "news_report": final_state["news_report"],
+            "news_execution": final_state.get("news_execution"),
             "fundamentals_report": final_state["fundamentals_report"],
             "investment_debate_state": {
                 "bull_history": final_state["investment_debate_state"]["bull_history"],

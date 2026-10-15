@@ -13,4 +13,7 @@
 #account-results p {font-size:13px;color:#5a667a;overflow-wrap:anywhere;}
 #account-metrics {margin-top:12px;}
 #account-metrics .value {font-size:17px;}
+#account-orders table, [data-live="trades"] table {min-width:1100px;}
+#account-orders th, #account-orders td:not(:last-child),
+[data-live="trades"] th, [data-live="trades"] td:not(:nth-child(6)) {white-space:nowrap;}
 @media(max-width:480px) {.account-toolbar>label {max-width:none;}.account-toolbar button {min-height:42px;}}

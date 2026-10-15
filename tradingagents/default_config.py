@@ -111,6 +111,10 @@ DEFAULT_CONFIG = _apply_env_overrides({
         "portfolio_manager": "openai",
     },
     "local_safe_validation": True,
+    # Hybrid local news: retry invalid evidence once, then use the existing
+    # OpenAI quick model once with the same catalog/validator. Pure Ollama never
+    # uses this cloud fallback. Set False to disable the paid fallback.
+    "news_openai_fallback": True,
     # When None, each provider's client falls back to its own default endpoint
     # (api.openai.com for OpenAI, generativelanguage.googleapis.com for Gemini, ...).
     # The CLI overrides this per provider when the user picks one. Keeping a

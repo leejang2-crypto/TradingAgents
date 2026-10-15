@@ -40,8 +40,10 @@
       table('account-holdings', ['종목', '보유 수량', '평균 매입원가', '현재가', '평가금액', '미실현손익', '시세 시각'],
         (account.positions || []).map(p => [p.symbol, fmt(p.quantity), fmt(p.averagePrice), fmt(p.lastPrice), fmt(p.marketValue), fmt(p.unrealizedPnl),
           (p.quoteTime || '-') + (p.stale ? ' · 지연' : '')]), '보유주식 없음');
-      table('account-orders', ['시각', '종목', '매매', '수량', '체결가', '상태 / 사유'],
-        (account.trades || []).map(t => [t.recordedAt, t.symbol, t.side, fmt(t.quantity), fmt(t.price), t.status + (t.reason ? ' · ' + t.reason : '')]), '가상 체결 이력 없음');
+      table('account-orders', ['시각', '종목', '매매', '수량', '체결가', '수수료', '세금', '실현손익', '처리 후 현금', '보유 수량 전 → 후', '상태 / 사유'],
+        (account.trades || []).map(t => [t.recordedAt, t.symbol, t.side, fmt(t.quantity), fmt(t.price), fmt(t.fee), fmt(t.tax),
+          fmt(t.realizedPnl), fmt(t.cashAfter), fmt(t.quantityBefore) + ' → ' + fmt(t.quantityAfter),
+          (t.status === 'SIMULATED_FILLED' ? '가상 체결 · 계좌 반영' : '모의 주문 거절') + (t.reason ? ' · ' + t.reason : '')]), '가상 체결 이력 없음');
     } else {
       const h = account?.holdings, power = account?.buyingPower || {};
       el('account-source').textContent = 'Toss API · ' + (account?.asOf || '미조회');

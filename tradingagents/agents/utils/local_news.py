@@ -4,6 +4,12 @@ import json
 import re
 
 
+class NewsAnalysisError(ValueError):
+    def __init__(self, message, execution):
+        super().__init__(message)
+        self.news_execution = execution
+
+
 def prepare_news_sources(news: str) -> list[str]:
     text = news[:14000]
     articles = re.split(r"(?m)^### ", text)
@@ -76,7 +82,7 @@ def render_verified_news(content: str, ticker: str, sources: list[str]) -> str:
     """Legacy quote-format validator, also used for Python-resolved selections."""
     items = _parse_evidence(content, ticker)["items"]
     categories = {"catalyst": "Catalyst", "risk": "Risk", "uncertainty": "Uncertainty", "neutral": "Neutral"}
-    lines = [f"## News evidence: {ticker}", "", "Local LLM classifications are interpretations; quoted excerpts below are source-verified, not independently fact-checked.", ""]
+    lines = [f"## News evidence: {ticker}", "", "LLM classifications are interpretations; quoted excerpts below are source-verified, not independently fact-checked.", ""]
     for item in items:
         if not isinstance(item, dict):
             raise ValueError("Invalid local news evidence item.")

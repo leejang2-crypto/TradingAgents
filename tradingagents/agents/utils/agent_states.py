@@ -59,6 +59,7 @@ class AgentState(MessagesState):
         str, "Report from the News Researcher of current world affairs"
     ]
     fundamentals_report: Annotated[str, "Report from the Fundamentals Researcher"]
+    news_execution: Annotated[dict, "News evidence validation attempts and actual provider"]
 
     # researcher team discussion step
     investment_debate_state: Annotated[

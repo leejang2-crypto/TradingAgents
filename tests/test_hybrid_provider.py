@@ -69,6 +69,11 @@ def test_hybrid_graph_builds_agent_llm_routing(monkeypatch, tmp_path):
     assert graph.agent_llms["market_analyst"].startswith("ollama:qwen3:8b")
     assert graph.agent_llms["research_manager"].startswith("openai:gpt-5.5")
     assert graph.agent_llms["portfolio_manager"].startswith("openai:gpt-5.5")
+    assert graph.graph_setup.news_fallback_llm is graph.quick_thinking_llm
+    disabled = TradingAgentsGraph(selected_analysts=("market",), config={**config, "news_openai_fallback": False})
+    assert disabled.graph_setup.news_fallback_llm is None
+    local = TradingAgentsGraph(selected_analysts=("market",), config={**config, "llm_provider": "ollama"})
+    assert local.graph_setup.news_fallback_llm is None
 
 
 def test_local_safe_validation_catches_observed_ollama_failures():

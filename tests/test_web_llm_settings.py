@@ -170,13 +170,13 @@ def test_local_news_failure_does_not_silently_call_cloud(monkeypatch):
     '{"ticker":"005930.KS","items":[{"article":1,"excerpt":99,"signal":"risk"}]}',
     '{"ticker":"005930.KS","items":[{"article":1,"quote":"Reported earnings today.","signal":"risk"}]}',
 ])
-def test_local_news_invalid_selection_does_not_retry(monkeypatch, response):
+def test_local_news_invalid_selection_retries_once_without_implicit_cloud(monkeypatch, response):
     set_config({"news_local_single_pass": True})
     monkeypatch.setattr("tradingagents.agents.analysts.news_analyst.get_news", Mock(invoke=Mock(return_value="Reported earnings today.")))
     llm = Mock(invoke=Mock(return_value=AIMessage(content=response)))
     with pytest.raises(ValueError, match="unknown excerpt"):
         create_news_analyst(llm)({"trade_date": "2026-09-10", "company_of_interest": "005930.KS"})
-    llm.invoke.assert_called_once()
+    assert llm.invoke.call_count == 2
     llm.bind_tools.assert_not_called()
 
 

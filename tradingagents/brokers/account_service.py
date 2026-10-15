@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import sqlite3
 import threading
 import time
 from datetime import date, timedelta
@@ -50,6 +51,45 @@ def paper_account(local_dir, capital="10000000"):
         tax_rate=os.getenv("TRADINGAGENTS_PAPER_SELL_TAX_RATE", "0"),
         slippage=os.getenv("TRADINGAGENTS_PAPER_SLIPPAGE_RATE", "0"))
     return account
+
+
+def paper_history(local_dir, journal, limit=30):
+    """Render ledger-backed executions separately from legacy order intents."""
+    path = Path(local_dir) / "accounts" / "paper.sqlite3"
+    fills = {}
+    if path.exists():
+        db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            for row in db.execute("SELECT payload FROM fills ORDER BY recorded_at DESC,rowid DESC LIMIT ?", (limit,)):
+                fill = json.loads(row[0])
+                fills[fill["id"]] = fill
+            for entry in journal:
+                key = (entry.get("simulation") or {}).get("id") or (entry.get("payload") or {}).get("clientOrderId")
+                if key and key not in fills:
+                    row = db.execute("SELECT payload FROM fills WHERE id=?", (key,)).fetchone()
+                    if row:
+                        fills[key] = json.loads(row[0])
+        finally:
+            db.close()
+    rows, seen = [], set()
+    for entry in journal:
+        key = (entry.get("simulation") or {}).get("id") or (entry.get("payload") or {}).get("clientOrderId")
+        if key in fills:
+            if key in seen:
+                continue
+            seen.add(key)
+            fill = fills[key]
+            rows.append({**entry, "recordedAt": fill["recordedAt"], "status": fill["status"],
+                         "simulation": fill, "ledgerBacked": True, "fillVerified": False})
+        else:
+            rows.append({**entry, "status": "RECORDED", "originalStatus": entry.get("status"),
+                         "simulation": None, "ledgerBacked": False, "fillVerified": False})
+    for key, fill in fills.items():
+        if key not in seen:
+            rows.append({"recordedAt": fill["recordedAt"], "status": fill["status"],
+                         "plan": {"symbol": fill["symbol"], "action": fill["side"]},
+                         "simulation": fill, "ledgerBacked": True, "fillVerified": False})
+    return sorted(rows, key=lambda row: row.get("recordedAt", ""))[-limit:]
 
 
 def live_cache_path(local_dir):
