@@ -27,10 +27,11 @@ from tradingagents.agents.utils.agent_utils import (
     get_verified_market_snapshot,
     resolve_instrument_identity,
 )
-from tradingagents.agents.utils.local_safe import hold_decision, validate_trading_state
+from tradingagents.agents.utils.local_safe import review_decision, validate_trading_state
 from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.agents.utils.experience import ExperienceStore, ROLE_FIELDS
-from tradingagents.dataflows.config import set_config
+from tradingagents.dataflows.config import set_config, run_config
+from tradingagents.agents.utils.rating import run_rating
 from tradingagents.dataflows.utils import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients import create_llm_client
@@ -463,6 +464,10 @@ class TradingAgentsGraph:
         ])
 
     def propagate(self, company_name, trade_date, asset_type: str = "stock"):
+        with run_config(self.config, company_name, str(trade_date)):
+            return self._propagate_scoped(company_name, trade_date, asset_type)
+
+    def _propagate_scoped(self, company_name, trade_date, asset_type="stock"):
         """Run the trading agents graph for a company on a specific date.
 
         ``asset_type`` selects between the stock pipeline (default) and the
@@ -575,6 +580,7 @@ class TradingAgentsGraph:
 
         # Store current state for reflection.
         self._apply_local_safe_validation(final_state, company_name)
+        final_state["final_rating"] = run_rating(final_state)
         self.curr_state = final_state
 
         if self.config.get("experience_enabled"):
@@ -589,6 +595,7 @@ class TradingAgentsGraph:
                 ticker=company_name,
                 trade_date=trade_date,
                 final_trade_decision=final_state["final_trade_decision"],
+                final_rating=final_state["final_rating"],
             )
 
         # Clear checkpoint on successful completion to avoid stale state.
@@ -598,7 +605,7 @@ class TradingAgentsGraph:
                 self._run_signature(asset_type),
             )
 
-        return final_state, self.process_signal(final_state["final_trade_decision"])
+        return final_state, final_state["final_rating"]
 
     def _apply_local_safe_validation(self, final_state: dict, ticker: str) -> None:
         provider = self.config.get("llm_provider", "").lower()
@@ -616,12 +623,13 @@ class TradingAgentsGraph:
             return
 
         logger.warning(
-            "Local-safe validation failed for %s; forcing HOLD: %s",
+            "Local-safe validation failed for %s; requiring REVIEW: %s",
             ticker,
             "; ".join(validation.reasons),
         )
-        decision = hold_decision(validation.reasons)
+        decision = review_decision(validation.reasons)
         final_state["final_trade_decision"] = decision
+        final_state["final_rating"] = "REVIEW"
         risk_state = final_state.get("risk_debate_state")
         if isinstance(risk_state, dict):
             risk_state["judge_decision"] = decision
@@ -657,6 +665,7 @@ class TradingAgentsGraph:
             },
             "investment_plan": final_state["investment_plan"],
             "final_trade_decision": final_state["final_trade_decision"],
+            "final_rating": final_state.get("final_rating"),
         }
 
         # Save to file. Reject ticker values that would escape the

@@ -18,8 +18,9 @@ from tradingagents.agents.utils.agent_utils import (
 )
 from tradingagents.agents.utils.structured import (
     bind_structured,
-    invoke_structured_or_freetext,
+    invoke_typed,
 )
+from tradingagents.agents.utils.rating import parse_rating
 
 
 def create_portfolio_manager(llm):
@@ -67,13 +68,14 @@ def create_portfolio_manager(llm):
 
 Be decisive and ground every conclusion in specific evidence from the analysts. For the configured intraday objective, approve BUY/SELL only when the setup has a plausible same-day path, clear risk controls, and liquidity suitable for the default per-trade budget.{get_language_instruction()}"""
 
-        final_trade_decision = invoke_structured_or_freetext(
-            structured_llm,
-            llm,
-            prompt,
-            render_pm_decision,
-            "Portfolio Manager",
-        )
+        prompt += "\nStart with your own final decision on a separate English-labelled line: Rating: Buy / Overweight / Hold / Underweight / Sell. Do not substitute a quoted party's rating for your own."
+        decision = invoke_typed(structured_llm, prompt, PortfolioDecision)
+        if decision is not None:
+            final_trade_decision = render_pm_decision(decision)
+            final_rating = decision.rating.value
+        else:
+            final_trade_decision = llm.invoke(prompt).content
+            final_rating = parse_rating(final_trade_decision)
 
         new_risk_debate_state = {
             "judge_decision": final_trade_decision,
@@ -91,6 +93,7 @@ Be decisive and ground every conclusion in specific evidence from the analysts. 
         return {
             "risk_debate_state": new_risk_debate_state,
             "final_trade_decision": final_trade_decision,
+            "final_rating": final_rating,
         }
 
     return portfolio_manager_node

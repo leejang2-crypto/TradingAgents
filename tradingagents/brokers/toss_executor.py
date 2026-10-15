@@ -10,7 +10,7 @@ from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Any
 
-from tradingagents.agents.utils.rating import parse_rating
+from tradingagents.agents.utils.rating import parse_rating, RATINGS_5_TIER
 from tradingagents.monitoring.control import RunStopped, checkpoint
 
 from .toss_client import TossClient
@@ -53,8 +53,12 @@ def plan_from_decision(
     price: Decimal | None = None,
     max_order_amount: Decimal | None = None,
     min_quantity: Decimal = Decimal("1"),
+    final_rating: str | None = None,
 ) -> TossOrderPlan:
-    rating = parse_rating(decision_text)
+    rating = parse_rating(decision_text) if final_rating is None else final_rating
+    if rating not in RATINGS_5_TIER:
+        return TossOrderPlan(action="REVIEW", rating="REVIEW", symbol=toss_symbol(symbol),
+                             reason="Final decision is missing or ambiguous; order blocked.")
     broker_symbol = toss_symbol(symbol)
     if not min_quantity.is_finite() or min_quantity <= 0:
         raise ValueError("min_quantity must be finite and positive.")
@@ -167,6 +171,9 @@ async def execute_plan(
     paper_capital: str = "10000000",
 ) -> dict[str, Any]:
     checkpoint("order-preparation")
+    if plan.action == "REVIEW" or plan.rating == "REVIEW":
+        return {"ok": False, "executed": False, "dryRun": not execute,
+                "skipped": "decision-review", "plan": plan.__dict__, "payload": {}}
     payload = order_payload(plan)
     if not payload:
         return {"executed": False, "dryRun": not execute, "plan": plan.__dict__, "payload": payload}

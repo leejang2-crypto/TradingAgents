@@ -3,6 +3,7 @@ from typing import Annotated
 from langchain_core.tools import tool
 
 from tradingagents.dataflows.interface import route_to_vendor
+from .tool_scope import instrument, window
 
 
 @tool
@@ -21,4 +22,8 @@ def get_stock_data(
     Returns:
         str: A formatted dataframe containing the stock price data for the specified ticker symbol in the specified date range.
     """
-    return route_to_vendor("get_stock_data", symbol, start_date, end_date)
+    try:
+        start_date, end_date = window(start_date, end_date)
+    except ValueError as exc:
+        return str(exc)
+    return route_to_vendor("get_stock_data", instrument(symbol), start_date, end_date)

@@ -129,7 +129,7 @@ def validate_trading_state(final_state: dict, ticker: str) -> ValidationResult:
         reasons.append("final_trade_decision appears truncated or incomplete")
 
     trader_action = _extract_action(str(final_state.get("trader_investment_plan", "")))
-    portfolio_rating = parse_rating(final_decision, default="Hold")
+    portfolio_rating = final_state.get("final_rating") or parse_rating(final_decision)
     portfolio_action = _rating_to_action(portfolio_rating)
     if trader_action in {"BUY", "SELL"} and portfolio_action in {"BUY", "SELL"}:
         if trader_action != portfolio_action:
@@ -140,12 +140,12 @@ def validate_trading_state(final_state: dict, ticker: str) -> ValidationResult:
     return ValidationResult(ok=not reasons, reasons=tuple(reasons))
 
 
-def hold_decision(reasons: tuple[str, ...]) -> str:
+def review_decision(reasons: tuple[str, ...]) -> str:
     reason_lines = "\n".join(f"- {reason}" for reason in reasons)
     return (
-        "**Rating**: Hold\n\n"
+        "**Rating**: REVIEW\n\n"
         "**Executive Summary**: Local/hybrid output validation failed, so the "
-        "system forced a defensive HOLD instead of allowing an automated trade.\n\n"
+        "system requires REVIEW instead of allowing an automated trade.\n\n"
         "**Validation Findings**:\n"
         f"{reason_lines}\n\n"
         "**Investment Thesis**: The analysis chain produced mechanically unsafe "

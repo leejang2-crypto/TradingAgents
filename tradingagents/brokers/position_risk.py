@@ -607,6 +607,9 @@ class PositionRiskManager:
                 self.store.save(state)
 
     def execute(self, plan, experience_id=None):
+        if plan.action == "REVIEW" or plan.rating == "REVIEW":
+            return {"ok": False, "executed": False, "dryRun": not self.live,
+                    "skipped": "decision-review", "plan": plan.__dict__}
         import re
         from tradingagents.monitoring.control import checkpoint
         signal, signal_error, signal_settings = None, None, None

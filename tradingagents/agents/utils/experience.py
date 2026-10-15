@@ -98,7 +98,8 @@ class ExperienceStore:
                 value = value.get(field, "") if isinstance(value, dict) else ""
             if isinstance(value, str) and value.strip():
                 reports[role] = value
-        payload = {"reports": reports, "validation": state.get("local_safe_validation", {})}
+        payload = {"reports": reports, "validation": state.get("local_safe_validation", {}),
+                   "finalRating": state.get("final_rating"), "newsExecution": state.get("news_execution")}
         with self.connect() as db:
             previous = db.execute("SELECT payload FROM events WHERE run_id=? AND kind='ANALYSIS' ORDER BY id DESC LIMIT 1", (run_id,)).fetchone()
             if previous and json.loads(previous["payload"]) == payload:
@@ -166,6 +167,8 @@ class ExperienceStore:
                     analyses = [json.loads(e["payload"]) for e in events if e["kind"] == "ANALYSIS"]
                     report = analyses[-1].get("reports", {}).get(role) if analyses else None
                     if not report:
+                        continue
+                    if analyses[-1].get("finalRating") == "REVIEW":
                         continue
                     # Never feed raw broker responses/account data into prompts.
                     processing = [e["kind"] for e in events]

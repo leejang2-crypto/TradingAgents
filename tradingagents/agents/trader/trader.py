@@ -26,6 +26,12 @@ def create_trader(llm):
         instrument_context = get_instrument_context_from_state(state)
         objective_instruction = get_trading_objective_instruction()
         investment_plan = state["investment_plan"]
+        market_report = state.get("market_report") or ""
+        market_section = (
+            f"Technical Market Report:\n{market_report}\n\n"
+            "Ground entry, stop-loss and take-profit price levels in this report's dated price data. "
+            "Do not invent unavailable levels or treat an old close as a live quote.\n\n"
+        ) if market_report else ""
 
         messages = [
             {
@@ -47,6 +53,7 @@ def create_trader(llm):
                     f"social media sentiment. Use this plan as a foundation for evaluating your next "
                     f"trading decision.\n\nProposed Investment Plan: {investment_plan}\n\n"
                     f"{objective_instruction}\n\n"
+                    f"{market_section}"
                     f"Leverage these insights to make an informed and strategic decision."
                 ),
             },

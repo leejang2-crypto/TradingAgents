@@ -216,7 +216,8 @@ def test_runner_links_reports_and_trade_result(tmp_path, monkeypatch, execute, a
     monkeypatch.setattr(main, "is_regular_market_open", lambda *a, **kw: True)
     args = main.make_parser().parse_args(["--scenario", "korea-execute" if execute else "korea-dry-run", "--yes", "--date", "2026-09-01"])
     graph = Mock()
-    graph.propagate.return_value = ({"news_report": "news evidence", "final_trade_decision": f"**Rating**: {action}"}, action)
+    rating = "Buy" if action == "error" else action
+    graph.propagate.return_value = ({"news_report": "news evidence", "final_trade_decision": f"**Rating**: {rating}"}, rating)
     graph.save_reports.return_value = "report.md"
     factory = Mock(return_value=graph)
     monkeypatch.setattr(main, "TradingAgentsGraph", factory)

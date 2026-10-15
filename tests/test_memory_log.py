@@ -171,10 +171,10 @@ class TestTradingMemoryLogCore:
         log.store_decision("AAPL", "2026-01-11", DECISION_OVERWEIGHT)
         assert log.load_entries()[0]["rating"] == "Overweight"
 
-    def test_rating_fallback_hold(self, tmp_path):
+    def test_rating_fallback_review(self, tmp_path):
         log = make_log(tmp_path)
         log.store_decision("MSFT", "2026-01-12", DECISION_NO_RATING)
-        assert log.load_entries()[0]["rating"] == "Hold"
+        assert log.load_entries()[0]["rating"] == "REVIEW"
 
     def test_rating_priority_over_prose(self, tmp_path):
         """'Rating: X' label wins even when an opposing rating word appears earlier in prose."""
@@ -863,6 +863,9 @@ class TestLegacyRemoval:
         # the actual write path instead of the auto-MagicMock.
         mock_graph._run_graph = functools.partial(
             TradingAgentsGraph._run_graph, mock_graph
+        )
+        mock_graph._propagate_scoped = functools.partial(
+            TradingAgentsGraph._propagate_scoped, mock_graph
         )
         TradingAgentsGraph.propagate(mock_graph, "NVDA", "2026-01-10")
         entries = mock_graph.memory_log.load_entries()

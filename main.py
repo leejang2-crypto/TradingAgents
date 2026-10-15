@@ -1965,9 +1965,13 @@ async def run_korea_toss(args: argparse.Namespace, *, execute: bool) -> dict[str
         plan = plan_from_decision(
             final_state.get("final_trade_decision") or decision,
             args.korea_ticker, max_order_amount=order_budget(args),
+            final_rating=final_state.get("final_rating"),
         )
         store.event(run_id, "PLANNED", {"plan": plan.__dict__, "reportPath": str(report_path)})
-        if getattr(args, "_analysis_only", False):
+        if plan.action == "REVIEW":
+            execution = {"ok": False, "executed": False, "dryRun": not execute,
+                         "skipped": "decision-review", "plan": plan.__dict__}
+        elif getattr(args, "_analysis_only", False):
             execution = {"executed": False, "dryRun": not execute, "skipped": "analysis-only", "plan": plan.__dict__}
         elif args.scenario in AUTO_SCENARIOS and (args.run_mode == "daily-market" or execute) and not is_regular_market_open(
             datetime.now(KOREA_TZ), open_text=args.market_open, close_text=args.market_close,

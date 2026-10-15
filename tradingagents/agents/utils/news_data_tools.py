@@ -3,6 +3,7 @@ from typing import Annotated
 from langchain_core.tools import tool
 
 from tradingagents.dataflows.interface import route_to_vendor
+from .tool_scope import instrument, as_of, window
 
 
 @tool
@@ -21,7 +22,11 @@ def get_news(
     Returns:
         str: A formatted string containing news data
     """
-    return route_to_vendor("get_news", ticker, start_date, end_date)
+    try:
+        start_date, end_date = window(start_date, end_date)
+    except ValueError as exc:
+        return str(exc)
+    return route_to_vendor("get_news", instrument(ticker), start_date, end_date)
 
 @tool
 def get_global_news(
@@ -43,7 +48,7 @@ def get_global_news(
     Returns:
         str: A formatted string containing global news data
     """
-    return route_to_vendor("get_global_news", curr_date, look_back_days, limit)
+    return route_to_vendor("get_global_news", as_of(curr_date), look_back_days, limit)
 
 @tool
 def get_insider_transactions(
@@ -57,4 +62,4 @@ def get_insider_transactions(
     Returns:
         str: A report of insider transaction data
     """
-    return route_to_vendor("get_insider_transactions", ticker)
+    return route_to_vendor("get_insider_transactions", instrument(ticker))

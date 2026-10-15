@@ -1,9 +1,29 @@
 from copy import deepcopy
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import tradingagents.default_config as default_config
 
 # Use default config but allow it to be overridden
 _config: dict | None = None
+_run_config = ContextVar("tradingagents_run_config", default=None)
+
+
+@contextmanager
+def run_config(config, ticker=None, trade_date=None):
+    scoped = deepcopy(default_config.DEFAULT_CONFIG)
+    for key, value in deepcopy(config).items():
+        if isinstance(value, dict) and isinstance(scoped.get(key), dict):
+            scoped[key].update(value)
+        else:
+            scoped[key] = value
+    scoped["analysis_ticker"] = ticker
+    scoped["analysis_date"] = trade_date
+    token = _run_config.set(scoped)
+    try:
+        yield
+    finally:
+        _run_config.reset(token)
 
 
 def initialize_config():
@@ -32,6 +52,8 @@ def set_config(config: dict):
 
 def get_config() -> dict:
     """Get the current configuration."""
+    if _run_config.get() is not None:
+        return deepcopy(_run_config.get())
     if _config is None:
         initialize_config()
     return deepcopy(_config)

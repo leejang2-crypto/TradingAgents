@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+import tempfile
 from typing import Annotated
 
 import pandas as pd
@@ -18,6 +19,26 @@ logger = logging.getLogger(__name__)
 # is treated as stale. Generous enough to span long holiday weekends, tight
 # enough to catch the year-old frames yfinance occasionally returns (#1021).
 MAX_OHLCV_STALE_DAYS = 10
+OHLCV_CACHE_TTL_SECONDS = 900
+
+
+def _needs_same_day_refresh(path, requested, today):
+    return requested.date() >= today.date() and time.time() - os.path.getmtime(path) >= OHLCV_CACHE_TTL_SECONDS
+
+
+def _write_cache(data, path):
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(path),
+                                         suffix=".tmp", delete=False) as handle:
+            temporary = handle.name
+            data.to_csv(handle, index=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def yf_retry(func, max_retries=3, base_delay=2.0):
@@ -56,7 +77,7 @@ def _ensure_date_column(data: pd.DataFrame) -> pd.DataFrame:
 
 def _clean_dataframe(data: pd.DataFrame) -> pd.DataFrame:
     """Normalize a stock DataFrame for stockstats: parse dates, drop invalid rows, fill price gaps."""
-    data = _ensure_date_column(data)
+    data = _ensure_date_column(data).copy()
     data["Date"] = pd.to_datetime(data["Date"], errors="coerce")
     data = data.dropna(subset=["Date"])
 
@@ -158,9 +179,13 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
     # re-fetch rather than serving the poisoned file forever.
     data = None
     if os.path.exists(data_file):
-        cached = pd.read_csv(data_file, on_bad_lines="skip", encoding="utf-8")
-        if not cached.empty and "Close" in cached.columns:
-            data = cached
+        try:
+            cached = pd.read_csv(data_file, encoding="utf-8")
+            if (not cached.empty and "Close" in cached.columns
+                    and not _needs_same_day_refresh(data_file, curr_date_dt, today_date)):
+                data = cached
+        except (OSError, ValueError, pd.errors.ParserError):
+            logger.warning("Unusable OHLCV cache; fetching a fresh snapshot")
 
     if data is None:
         downloaded = yf_retry(lambda: yf.download(
@@ -177,7 +202,7 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
             raise NoMarketDataError(
                 symbol, canonical, "Yahoo Finance returned no rows"
             )
-        downloaded.to_csv(data_file, index=False, encoding="utf-8")
+        _write_cache(downloaded, data_file)
         data = downloaded
 
     data = _clean_dataframe(data)

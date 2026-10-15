@@ -3,6 +3,7 @@ from typing import Annotated
 from langchain_core.tools import tool
 
 from tradingagents.dataflows.interface import route_to_vendor
+from .tool_scope import as_of
 
 
 @tool
@@ -33,4 +34,4 @@ def get_macro_indicators(
     Returns:
         str: A formatted markdown report of the macro series
     """
-    return route_to_vendor("get_macro_indicators", indicator, curr_date, look_back_days)
+    return route_to_vendor("get_macro_indicators", indicator, as_of(curr_date), look_back_days)

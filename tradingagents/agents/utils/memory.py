@@ -32,6 +32,7 @@ class TradingMemoryLog:
         ticker: str,
         trade_date: str,
         final_trade_decision: str,
+        final_rating: str | None = None,
     ) -> None:
         """Append pending entry at end of propagate(). No LLM call."""
         if not self._log_path:
@@ -42,7 +43,7 @@ class TradingMemoryLog:
             for line in raw.splitlines():
                 if line.startswith(f"[{trade_date} | {ticker} |") and line.endswith("| pending]"):
                     return
-        rating = parse_rating(final_trade_decision)
+        rating = final_rating if final_rating is not None else parse_rating(final_trade_decision)
         tag = f"[{trade_date} | {ticker} | {rating} | pending]"
         entry = f"{tag}\n\nDECISION:\n{final_trade_decision}{self._SEPARATOR}"
         with open(self._log_path, "a", encoding="utf-8") as f:
@@ -65,11 +66,11 @@ class TradingMemoryLog:
 
     def get_pending_entries(self) -> list[dict]:
         """Return entries with outcome:pending (for Phase B)."""
-        return [e for e in self.load_entries() if e.get("pending")]
+        return [e for e in self.load_entries() if e.get("pending") and e.get("rating") != "REVIEW"]
 
     def get_past_context(self, ticker: str, n_same: int = 5, n_cross: int = 3) -> str:
         """Return formatted past context string for agent prompt injection."""
-        entries = [e for e in self.load_entries() if not e.get("pending")]
+        entries = [e for e in self.load_entries() if not e.get("pending") and e.get("rating") != "REVIEW"]
         if not entries:
             return ""
 

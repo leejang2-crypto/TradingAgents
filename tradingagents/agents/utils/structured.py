@@ -23,6 +23,7 @@ from collections.abc import Callable
 from typing import Any, TypeVar
 
 from pydantic import BaseModel
+from tradingagents.monitoring.control import RunStopped
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,8 @@ def invoke_structured_or_freetext(
                 # as a structured miss and fall back, with a clear reason.
                 raise ValueError("structured output returned no parsed result")
             return render(result)
+        except RunStopped:
+            raise
         except Exception as exc:
             logger.warning(
                 "%s: structured-output invocation failed (%s); retrying once as free text",
@@ -77,3 +80,17 @@ def invoke_structured_or_freetext(
 
     response = plain_llm.invoke(prompt)
     return response.content
+
+
+def invoke_typed(structured_llm, prompt, schema):
+    """Keep the validated object so a rating need not be parsed back from prose."""
+    if structured_llm is None:
+        return None
+    try:
+        result = structured_llm.invoke(prompt)
+        return schema.model_validate(result)
+    except RunStopped:
+        raise
+    except Exception as exc:
+        logger.warning("%s structured result unavailable (%s)", schema.__name__, type(exc).__name__)
+        return None

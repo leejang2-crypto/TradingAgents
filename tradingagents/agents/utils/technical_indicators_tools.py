@@ -3,6 +3,7 @@ from typing import Annotated
 from langchain_core.tools import tool
 
 from tradingagents.dataflows.interface import route_to_vendor
+from .tool_scope import instrument, as_of
 
 
 @tool
@@ -26,6 +27,10 @@ def get_indicators(
     # LLMs sometimes pass multiple indicators as a comma-separated string;
     # split and process each individually.
     indicators = [i.strip().lower() for i in indicator.split(",") if i.strip()]
+    try:
+        symbol, curr_date = instrument(symbol), as_of(curr_date)
+    except ValueError as exc:
+        return str(exc)
     results = []
     for ind in indicators:
         try:
