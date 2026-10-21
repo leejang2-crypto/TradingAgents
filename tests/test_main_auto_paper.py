@@ -268,3 +268,44 @@ def test_resolve_monitor_host_errors_when_tailscale_ip_missing(monkeypatch):
         assert "Could not resolve a Tailscale IPv4 address" in str(exc)
     else:
         raise AssertionError("Expected RuntimeError")
+
+
+def test_tailscale_detection_with_minimal_finder_path(monkeypatch):
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args[0])
+        assert kwargs["timeout"] == 5
+        if args[0] != "/sbin/ifconfig":
+            raise FileNotFoundError
+        return subprocess.CompletedProcess(
+            args, 0, stdout="utun5: flags=8051\n inet 100.101.72.51 netmask 0xffffffff\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+    assert main.resolve_monitor_host("tailscale") == ("100.101.72.51", "100.101.72.51")
+    assert calls == ["tailscale", "ifconfig", "/sbin/ifconfig"]
+
+
+def test_tailscale_detection_recovers_from_command_timeout(monkeypatch):
+    def fake_run(args, **kwargs):
+        if args[0] != "/sbin/ifconfig":
+            raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+        return subprocess.CompletedProcess(
+            args, 0, stdout="utun5: inet 100.101.72.51\n", stderr="",
+        )
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+    assert main.find_tailscale_ipv4() == "100.101.72.51"
+
+
+def test_tailscale_detection_rejects_invalid_cli_and_interface_addresses(monkeypatch):
+    def fake_run(args, **kwargs):
+        output = "127.0.0.1\n::1\nnot-an-address\n" if args[0] == "tailscale" else (
+            "lo0: inet 127.0.0.1\nutun4: inet 999.99.99.99\n"
+        )
+        return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+    assert main.find_tailscale_ipv4() is None

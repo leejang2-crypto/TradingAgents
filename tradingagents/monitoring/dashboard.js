@@ -114,6 +114,69 @@
   });
   window.addEventListener('pagehide', () => { scrolls[current] = window.scrollY; persist(); });
   const summaryDialog = el('summary-dialog');
+  let localSummaryBusy = false;
+  const localSummaryStates = new Map();
+  function drawLocalSummary() {
+    const panel = el('local-summary-panel');
+    if (!panel) return;
+    const data = localSummaryStates.get(panel.dataset.query);
+    if (!data) return;
+    const busy = data.status === 'running';
+    el('local-summary-generate').disabled = busy || !panel.dataset.query;
+    el('local-summary-generate').textContent = data.status === 'error' ? '요약 다시 시도' : '로컬 요약 생성';
+    const labels = {idle: '요약 생성 전', running: '로컬 모델 요약 중...', completed: '요약 완료', error: '요약 실패', busy: '다른 요약 생성 중'};
+    const sourceOnly = (data.items || []).some(item => item.summaryKind === 'source-only');
+    el('local-summary-status').textContent = `${labels[data.status] || ''}${sourceOnly ? ' (원문 표시 포함)' : ''} · ${data.model || ''}` + (data.error ? ` · ${data.error}` : '')
+      + (data.generatedAt ? ` · ${new Date(data.generatedAt).toLocaleString()}` : '');
+    const result = el('local-summary-result'); result.replaceChildren();
+    if (data.status !== 'completed') return;
+    const facts = data.facts;
+    result.append(text('p', `${facts.date || '날짜 미상'} · ${facts.executionMode === 'live' ? '실투자' : facts.executionMode === 'dry-run' ? '모의투자' : '모드 미상'} · 분석 ${facts.total}종목 · 원본 실행 상태: ${facts.ok === true ? '성공' : facts.ok === false ? '오류/미완료 포함' : '미상'}`));
+    result.append(text('p', 'AI 참고 요약입니다. 근거는 선택된 원문에서 직접 표시하며, 해석의 정확성이나 주문 체결을 보장하지 않습니다.', 'muted'));
+    if (facts.partial) result.append(text('p', '일부 요약: 최대 8종목, 종목당 근거 앞부분 1,600자 기준입니다. 전체 내용은 원문을 확인하세요.', 'local-summary-warning'));
+    if (facts.selectionReason) result.append(text('p', '후보 선정 상태: ' + facts.selectionReason));
+    if (facts.error) result.append(text('p', '원본 실행 오류: ' + facts.error, 'local-summary-warning'));
+    if (!data.items.length) result.append(text('p', '종목별 분석 결과가 없습니다. 원본 파일의 오류 및 후보 선정 상태를 확인하세요.'));
+    data.items.forEach(item => {
+      const article = document.createElement('article');
+      article.append(text('h4', `${item.name} (${item.ticker})`));
+      article.append(text('p', item.summary));
+      article.append(text('p', item.sourceKind === 'portfolio-report' ? '근거 자료: 상세 보고서의 최종 포트폴리오 판단' : '근거 자료: 분석 요약 파일의 판정/오류', 'muted'));
+      if (item.warning) article.append(text('p', item.warning, 'local-summary-warning'));
+      if (item.error) article.append(text('p', '원본 분석 오류: ' + item.error, 'local-summary-warning'));
+      article.append(text('p', `원본 주문 계획: ${item.plannedAction || '기록 없음'} · 체결 확인: ${item.fillVerified ? '원본에서 확인됨' : '미확인'} · 분석 오류: ${item.analysisOk === false ? '있음' : '기록 없음'}`, 'muted'));
+      const evidence = document.createElement('details');
+      evidence.open = item.summaryKind === 'source-only';
+      evidence.append(text('summary', '원문 근거'), text('blockquote', item.evidence));
+      article.append(evidence); result.append(article);
+    });
+  }
+  async function loadLocalSummary(start = false) {
+    const query = el('local-summary-panel')?.dataset.query;
+    if (!query || localSummaryBusy) return;
+    localSummaryBusy = true;
+    try {
+      const response = await fetch('/api/analysis-summary/local?' + query, start ? {
+        method: 'POST', headers: {'Content-Type': 'application/json', 'X-Requested-With': 'TradingAgents'}, body: '{}',
+      } : {cache: 'no-store'});
+      if (response.status === 401) { window.location.assign('/login'); return; }
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '로컬 요약 조회 실패');
+      localSummaryStates.set(query, data);
+      if (localSummaryStates.size > 16) localSummaryStates.delete(localSummaryStates.keys().next().value);
+    } catch (error) {
+      localSummaryStates.set(query, {status: 'error', error: error.message});
+    } finally { localSummaryBusy = false; drawLocalSummary(); }
+  }
+  document.addEventListener('click', event => {
+    if (event.target.closest('#local-summary-generate')) loadLocalSummary(true);
+  });
+  loadLocalSummary();
+  setInterval(() => {
+    if (document.hidden || current !== 'analysis') return;
+    const state = localSummaryStates.get(el('local-summary-panel')?.dataset.query);
+    if (!state || ['idle', 'running', 'busy'].includes(state.status)) loadLocalSummary();
+  }, 4000);
   let summaryRequest = null;
   let summaryTrigger = null;
   el('summary-close').addEventListener('click', () => summaryDialog.close());
@@ -246,6 +309,7 @@
       panel.querySelectorAll('details[data-detail-key]').forEach(detail => { folds[detail.dataset.detailKey] = detail.open; });
       restoreFolds(replacement);
       panel.replaceWith(replacement); replacement.scrollLeft = scroll;
+      drawLocalSummary();
       enhanceTables(); globalStatus();
       window.scrollTo({top: y, behavior: 'instant'});
     },

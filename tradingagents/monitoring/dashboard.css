@@ -27,6 +27,13 @@ details > summary { cursor: pointer; padding: 8px 0; font-size: 14px; overflow-w
 .settings-savebar .message { min-height: 0; }
 #settings-dirty { font-size: 13px; color: #885219; }
 .analysis-content { white-space: pre-wrap; line-height: 1.6; max-height: 420px; overflow: auto; min-width: 180px; }
+#local-summary-panel { margin-top: 18px; border-top: 1px solid #c9d0dc; padding-top: 12px; min-width: 0; }
+#local-summary-panel h3 { font-size: 16px; }
+#local-summary-panel h4 { font-size: 14px; margin: 12px 0 6px; }
+#local-summary-panel p, #local-summary-panel blockquote { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
+#local-summary-panel article { border-top: 1px solid #e2e6eb; padding: 8px 0; }
+#local-summary-panel blockquote { margin: 10px 0; border-left: 3px solid #147669; padding-left: 12px; }
+.local-summary-warning { color: #a52d39; }
 [data-summary-link] { color: #126b5d; text-decoration: underline; text-underline-offset: 3px; }
 [data-summary-link] code { color: inherit; }
 #summary-dialog { box-sizing: border-box; width: 960px; max-width: calc(100% - 24px); max-height: calc(100dvh - 24px); padding: 20px; }

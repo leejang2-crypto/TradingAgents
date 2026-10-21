@@ -78,3 +78,6 @@ def test_summary_path_opens_accessible_in_dashboard_viewer():
     assert links[0]['aria-haspopup'] == 'dialog'
     assert any(tag == 'dialog' and attrs.get('id') == 'summary-dialog' for tag, attrs in parsed.tags)
     assert 'data-summary-link' not in main.render_monitor_html({})
+    panel = next(attrs for _, attrs in parsed.tags if attrs.get('id') == 'local-summary-panel')
+    assert panel['data-query'] == 'mode=live&file=auto_live_2026-09-16.json'
+    assert html.index('analysis-path') < html.index('local-summary-panel')

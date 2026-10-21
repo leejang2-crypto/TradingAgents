@@ -58,6 +58,27 @@ def login(server):
     return headers["Set-Cookie"].split(";", 1)[0]
 
 
+def test_local_summary_requires_login_csrf_and_safe_path(server, tmp_path, monkeypatch):
+    from tradingagents.monitoring.summary import LocalSummaryService
+    server.local_summary = LocalSummaryService()
+    generate = Mock(return_value={"status": "running"})
+    monkeypatch.setattr(server.local_summary, "request", generate)
+    directory = tmp_path / "auto_paper"
+    directory.mkdir()
+    (directory / "auto_paper_test.json").write_text('{"analyses":[]}')
+    url = "/api/analysis-summary/local?mode=dry-run&file=auto_paper_test.json"
+    assert request(server, "GET", url)[0] == 401
+    assert request(server, "POST", url, {})[0] == 401
+    cookie = login(server)
+    assert request(server, "POST", url, {}, cookie=cookie, extra={"Origin": "http://evil.test"})[0] == 403
+    assert request(server, "POST", url.replace("auto_paper_test.json", "../secret.json"), {}, cookie=cookie)[0] == 400
+    generate.assert_not_called()
+    assert request(server, "GET", url, cookie=cookie)[0] == 202
+    assert generate.call_args.kwargs == {"start": False}
+    assert request(server, "POST", url, {}, cookie=cookie)[0] == 202
+    assert generate.call_args.kwargs == {"start": True}
+
+
 def test_password_stored_as_salted_scrypt_hash(tmp_path):
     path = tmp_path / "login.json"
     auth.register(path, "owner", "sample-password-1234")

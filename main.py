@@ -45,6 +45,7 @@ from tradingagents.dataflows.utils import safe_ticker_component
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.llm_clients.routing import AGENT_LABELS, DEEP_AGENTS, LLM_DEFAULTS, NEWS_ONLY_ROUTING, describe_routing
 from tradingagents.monitoring.auth import DashboardAuth, LoginError
+from tradingagents.monitoring.summary import LocalSummaryService, with_report_evidence
 from tradingagents.monitoring.control import BusyError, RunController, RunStopped, checkpoint, scheduled_job
 from tradingagents.brokers.position_risk import PositionRiskManager, RISK_DEFAULTS
 from tradingagents.brokers.intraday import INTRADAY_DEFAULTS, DECIMAL_LIMITS, INTEGER_LIMITS
@@ -1266,6 +1267,12 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
       <table><thead><tr><th>Ticker</th><th>종목명</th><th>Rank</th><th>Decision / Error</th><th>Order</th><th>Report</th><th>사용 LLM</th></tr></thead>
       <tbody>{''.join(analysis_rows) or '<tr><td colspan="7">No analysis yet</td></tr>'}</tbody></table>
       <details data-detail-key="analysis-path"><summary>분석 요약 파일 경로</summary><p>{summary_link}</p></details>
+      <div id="local-summary-panel" data-query="{_compact_text(urlencode({'mode': 'live' if live else 'dry-run', 'file': Path(summary_path).name}) if summary_path else '', '')}">
+        <h3>핵심 분석 요약 · 로컬 LLM</h3>
+        <button type="button" id="local-summary-generate" {'disabled' if not summary_path else ''}>로컬 요약 생성</button>
+        <p id="local-summary-status" role="status">{'요약 생성 전' if summary_path else '분석 요약 파일이 아직 없습니다.'}</p>
+        <div id="local-summary-result"></div>
+      </div>
     </section>
     <section data-live="candidates">
       <h2>Candidate Ranking</h2>
@@ -1398,6 +1405,9 @@ class MonitorHandler(BaseHTTPRequestHandler):
             status, payload = read_analysis_summary(parse_qs(parsed.query, keep_blank_values=True))
             self._send_json(status, payload)
             return
+        if parsed.path == "/api/analysis-summary/local":
+            self._local_summary(parsed.query, start=False)
+            return
         if parsed.path == "/api/settings":
             self._send_json(200, {"settings": {**deepcopy(LLM_DEFAULTS), **load_trading_settings()}, "settingsPath": str(settings_path())})
             return
@@ -1420,7 +1430,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
     def _post(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path not in {"/api/settings", "/api/account/refresh", "/api/login", "/api/logout", "/api/control/run", "/api/control/pause", "/api/control/cancel-pending", "/api/positions/carry", "/api/positions/adopt", "/api/research/run", "/api/research/stop", "/api/research/universe"}:
+        if parsed.path not in {"/api/analysis-summary/local", "/api/settings", "/api/account/refresh", "/api/login", "/api/logout", "/api/control/run", "/api/control/pause", "/api/control/cancel-pending", "/api/positions/carry", "/api/positions/adopt", "/api/research/run", "/api/research/stop", "/api/research/universe"}:
             self.send_error(404)
             return
         if parsed.path != "/api/login" and not self._authorized():
@@ -1448,6 +1458,9 @@ class MonitorHandler(BaseHTTPRequestHandler):
                 payload = {key: values[-1] for key, values in parsed_form.items()}
             if not isinstance(payload, dict):
                 raise ValueError("Settings payload must be an object.")
+            if parsed.path == "/api/analysis-summary/local":
+                self._local_summary(parsed.query, start=True)
+                return
             if parsed.path.startswith("/api/research/"):
                 research = getattr(self.server, "research", None)
                 if not isinstance(research, ResearchService):
@@ -1533,6 +1546,19 @@ class MonitorHandler(BaseHTTPRequestHandler):
             return
         self._send_json(200, {"ok": True, "settings": saved, "settingsPath": str(settings_path())})
 
+    def _local_summary(self, query: str, *, start: bool) -> None:
+        status, payload = read_analysis_summary(parse_qs(query, keep_blank_values=True))
+        if status != 200:
+            self._send_json(status, payload)
+            return
+        service = getattr(self.server, "local_summary", None)
+        if not isinstance(service, LocalSummaryService):
+            self._send_json(503, {"ok": False, "error": "대시보드 서버를 재시작하세요."})
+            return
+        content = with_report_evidence(payload["content"], LOCAL_DIR)
+        state = service.request(content, load_trading_settings(), start=start)
+        self._send_json(202 if state["status"] == "running" else 200, {"ok": True, **state})
+
     def log_message(self, format: str, *args: Any) -> None:
         return
 
@@ -1540,6 +1566,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
 def start_monitor_server(host: str, port: int, *, scenario: str = "auto-paper", control=None, risk=None) -> ThreadingHTTPServer:
     bind_host, access_host = resolve_monitor_host(host)
     server = ThreadingHTTPServer((bind_host, port), MonitorHandler)
+    server.local_summary = LocalSummaryService()
     server.auth = DashboardAuth(LOCAL_DIR / "config/web_login.json",
                                secure_cookie=os.getenv("TRADINGAGENTS_WEB_SECURE_COOKIE", "").lower() in {"1", "true"})
     server.control = control
@@ -1588,34 +1615,43 @@ def resolve_monitor_host(host: str) -> tuple[str, str]:
 
 
 def find_tailscale_ipv4() -> str | None:
+    tailscale_network = ipaddress.ip_network("100.64.0.0/10")
+
+    def valid_address(value: str) -> str | None:
+        try:
+            candidate = ipaddress.IPv4Address(value)
+        except ipaddress.AddressValueError:
+            return None
+        return str(candidate) if candidate in tailscale_network else None
+
     try:
         result = subprocess.run(
             ["tailscale", "ip", "-4"],
             text=True,
             capture_output=True,
             check=False,
+            timeout=5,
         )
-    except FileNotFoundError:
+    except (OSError, subprocess.TimeoutExpired):
         result = None
-    if result and result.returncode == 0 and result.stdout.strip():
-        return result.stdout.strip().splitlines()[0]
+    if result and result.returncode == 0:
+        for line in result.stdout.splitlines():
+            if address := valid_address(line.strip()):
+                return address
 
-    try:
-        ifconfig = subprocess.run(
-            ["ifconfig"],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-    except FileNotFoundError:
-        return None
-    if ifconfig.returncode != 0:
-        return None
-    tailscale_network = ipaddress.ip_network("100.64.0.0/10")
-    for match in re.finditer(r"\binet\s+(\d+\.\d+\.\d+\.\d+)\b", ifconfig.stdout):
-        candidate = ipaddress.ip_address(match.group(1))
-        if candidate in tailscale_network:
-            return str(candidate)
+    # Finder-launched macOS terminals may omit /sbin from PATH.
+    for executable in ("ifconfig", "/sbin/ifconfig"):
+        try:
+            result = subprocess.run(
+                [executable], text=True, capture_output=True, check=False, timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode != 0:
+            continue
+        for match in re.finditer(r"\binet\s+(\d+\.\d+\.\d+\.\d+)\b", result.stdout):
+            if address := valid_address(match.group(1)):
+                return address
     return None
 
 
