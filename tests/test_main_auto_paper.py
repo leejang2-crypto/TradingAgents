@@ -42,6 +42,8 @@ def test_latest_analyses_empty_row_spans_name_column():
 @pytest.mark.parametrize("fails", [False, True])
 def test_auto_trading_persists_candidate_name_even_on_error(monkeypatch, tmp_path, fails):
     monkeypatch.setattr(main, "LOCAL_DIR", tmp_path)
+    monkeypatch.setattr(main, "screen_candidate_snapshot", lambda args, snapshot: {
+        **snapshot, "candidates": [{**row, "intraday": {"eligible": True}} for row in snapshot["candidates"]]})
     monkeypatch.setattr(main, "collect_candidate_snapshot", lambda args: {
         "ok": True, "universe": universe_snapshot(),
         "candidates": [{"ticker": "005930.KS", "name": "삼성전자"}],

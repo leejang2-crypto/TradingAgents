@@ -39,7 +39,7 @@ def create_research_manager(llm):
 - **Underweight**: Cautious view; recommend trimming exposure
 - **Sell**: Strong conviction in the bear thesis; recommend exiting or avoiding the position
 
-Commit to a clear stance whenever the debate's strongest arguments warrant one; reserve Hold for situations where the evidence on both sides is genuinely balanced. For the configured intraday objective, favor candidates with near-term liquidity, volatility, and same-day catalysts; penalize setups that require a multi-day thesis to work.
+Commit to a clear stance based on evidence. HOLD is also appropriate when entry triggers, fresh data, budget or risk controls do not support a trade. For a configured intraday objective, the intraday decision contract overrides the generic rating descriptions: favor near-term liquidity, volatility, and same-day catalysts; reject setups that require a multi-day thesis to work. Do not interpret a bearish view without holdings as permission to short sell.
 
 ---
 

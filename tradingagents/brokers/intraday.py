@@ -6,6 +6,7 @@ Only complete regular-session bars are accepted; missing data blocks entry.
 
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
+import time
 
 import pandas as pd
 
@@ -27,7 +28,11 @@ INTRADAY_DEFAULTS = {
     "stagnation_minutes": 90,
     "max_consecutive_stops": 3,
     "entry_strategy": "breakout",
+    "opening_range_minutes": 15,
+    "entry_watch_minutes": 30,
 }
+ENTRY_STRATEGIES = {"breakout": "직전 15분 고점 돌파", "opening_range": "장 초반 범위 돌파",
+                    "pullback": "VWAP 눌림목 회복", "vwap_reclaim": "VWAP 재돌파"}
 DECIMAL_LIMITS = {
     "position_target_return": ("0.001", "0.2"),
     "position_stop_loss": ("0.001", "0.1"),
@@ -41,7 +46,8 @@ DECIMAL_LIMITS = {
     "market_drop_limit": ("0.001", "0.1"),
     "max_entry_extension": ("0.0001", "0.02"),
 }
-INTEGER_LIMITS = {"stagnation_minutes": (15, 360), "max_consecutive_stops": (1, 10)}
+INTEGER_LIMITS = {"stagnation_minutes": (15, 360), "max_consecutive_stops": (1, 10),
+                  "opening_range_minutes": (5, 60), "entry_watch_minutes": (0, 120)}
 
 
 def stamp(value):
@@ -51,35 +57,120 @@ def stamp(value):
     return parsed.astimezone(KST)
 
 
-def session_candles(call, symbol, start, now, *, index=False):
-    """Bounded pagination, including the opening minute even for afternoon runs."""
+class CandleDataError(ValueError):
+    def __init__(self, diagnostics):
+        self.diagnostics = dict(diagnostics)
+        d = self.diagnostics
+        label = {"too-early": "최소 완성 분봉 대기", "missing": "분봉 누락",
+                 "unaligned": "분봉 시각 불일치"}[d["code"]]
+        super().__init__(
+            f"{d.get('symbol', '시세')} {label}: 필요 {d['expectedCount']}개 / 수신 {d['receivedCount']}개, "
+            f"최소 {d['minimumMinutes']}분, 최초 {d['firstAt'] or '-'}, 최종 {d['lastAt'] or '-'}, "
+            f"누락 {d['missingCount']}개 [{', '.join(d['missingAt'][:5])}], "
+            f"비정상 시각 {d['unexpectedCount']}개, 조회 {d.get('pageCount', 0)}회"
+        )
+
+
+def candle_coverage(timestamps, start, now, minimum_minutes=20, *, allow_opening_gap=False):
+    end = start + timedelta(minutes=int((now - start).total_seconds() // 300) * 5)
+    expected = set(pd.date_range(start + timedelta(minutes=1), end, freq="min"))
+    actual = {at for at in timestamps if start < at <= end}
+    missing, unexpected = sorted(expected - actual), sorted(actual - expected)
+    opening_gap = (allow_opening_gap and len(expected) >= minimum_minutes and not unexpected
+                   and missing == [start + timedelta(minutes=1)])
+    return {"code": "too-early" if len(expected) < minimum_minutes else "unaligned" if unexpected else "opening-gap" if opening_gap else "missing" if missing else "complete",
+            "acceptedOpeningGap": opening_gap,
+            "sessionStart": start.isoformat(), "asOf": now.isoformat(), "expectedEnd": end.isoformat(),
+            "minimumMinutes": minimum_minutes, "expectedCount": len(expected), "receivedCount": len(actual),
+            "firstAt": min(actual).isoformat() if actual else None, "lastAt": max(actual).isoformat() if actual else None,
+            "missingCount": len(missing), "missingAt": [at.isoformat() for at in missing],
+            "unexpectedCount": len(unexpected), "unexpectedAt": [at.isoformat() for at in unexpected]}
+
+
+def session_candles(call, symbol, start, now, *, index=False, diagnostics=None):
+    """Fetch to the opening boundary, then repair gaps using only actual API bars."""
     result, cursor, seen = {}, now.isoformat(), set()
-    for _ in range(3):
-        data = call("get_candles", symbol, before=cursor, index=index)
+    info = diagnostics if diagnostics is not None else {}
+    info.update(symbol=symbol, timestampKind="start" if index else "end", pageCount=0, retryCount=0, pages=[])
+    offset = timedelta(minutes=1) if index else timedelta(0)
+    end = stamp(candle_coverage([], start, now)["expectedEnd"])
+
+    def coverage():
+        info.update(candle_coverage(result, start, now))
+        return info["code"] == "complete"
+
+    def fetch(before):
+        from tradingagents.monitoring.control import checkpoint
+        checkpoint()
+        data = call("get_candles", symbol, before=before, index=index)
         rows = data.get("candles")
-        if not isinstance(rows, list) or not rows:
-            break
-        for row in rows:
-            # Stock candles use end times; indicator candles use START times.
-            at = stamp(row["timestamp"]) + (timedelta(minutes=1) if index else timedelta(0))
-            if start < at <= now:
+        if not isinstance(rows, list):
+            raise ValueError(f"{symbol}: Invalid candles response")
+        raw_times = [stamp(row["timestamp"]) for row in rows]
+        info["pageCount"] += 1
+        info["pages"].append({"before": before, "count": len(rows),
+            "firstAt": min(raw_times).isoformat() if raw_times else None,
+            "lastAt": max(raw_times).isoformat() if raw_times else None,
+            "nextBefore": data.get("nextBefore")})
+        for row, raw_at in zip(rows, raw_times):
+            # Indicator bars start at timestamp; stock bars end at timestamp.
+            at = raw_at + offset
+            if start < at <= end:
                 normalized = {**row, "timestamp": at.isoformat()}
                 if at in result and result[at] != normalized:
-                    raise ValueError("Conflicting duplicate candle")
+                    raise ValueError(f"{symbol}: Conflicting duplicate candle at {at.isoformat()}")
                 result[at] = normalized
-        if min(stamp(r["timestamp"]) for r in rows) <= start + (timedelta(0) if index else timedelta(minutes=1)):
-            break
-        cursor = data.get("nextBefore")
-        if not cursor or cursor in seen:
-            break
+        coverage()
+        return data, raw_times
+
+    coverage()
+    if info["code"] == "too-early":
+        raise CandleDataError(info)
+    # Some responses contain fewer than the requested 200 bars. Never assume page size.
+    for _ in range(12):
         seen.add(cursor)
+        data, raw_times = fetch(cursor)
+        if coverage():
+            info["paginationStop"] = "complete"
+            break
+        if not raw_times or min(raw_times) + offset <= start + timedelta(minutes=1):
+            info["paginationStop"] = "opening-or-empty"
+            break
+        next_cursor = data.get("nextBefore")
+        if not next_cursor:
+            info["paginationStop"] = "no-next-page"
+            break
+        if next_cursor in seen or stamp(next_cursor) >= stamp(cursor):
+            info["paginationStop"] = "cursor-not-moving"
+            break
+        cursor = next_cursor
+    else:
+        info["paginationStop"] = "page-limit"
+    if not coverage() and info["code"] == "missing":
+        missing = [stamp(at) for at in info["missingAt"]]
+        tail = len(missing) <= 2 and missing[-1] == end and missing[0] >= end - timedelta(minutes=1)
+        attempts = 2 if tail and (now - end).total_seconds() < 30 else 1
+        for _ in range(attempts):
+            if tail:
+                time.sleep(1)
+            # Query just beyond the last missing raw timestamp; never fabricate a bar.
+            before = min(now, stamp(info["missingAt"][-1]) - offset + timedelta(minutes=1))
+            info["retryCount"] += 1
+            fetch(before.isoformat())
+            if coverage() or info["code"] != "missing":
+                break
+    if not coverage():
+        if index and symbol in {"KOSPI", "KOSDAQ"}:
+            info.update(candle_coverage(result, start, now, allow_opening_gap=True))
+        if info["code"] != "opening-gap":
+            raise CandleDataError(info)
+        info["warning"] = "지수 개장 첫 1분 누락 허용: 첫 실제 관측 봉 기준, 첫 1분 변동 미반영"
     return list(result.values())
 
 
-def bars(rows, start, now, *, index=False):
+def _minute_frame(rows, start, now, *, index=False, minimum_minutes=20):
     # Discard the forming 5m bar, but never fill missing minutes with invented prices.
     end = start + timedelta(minutes=int((now - start).total_seconds() // 300) * 5)
-    expected = pd.date_range(start + timedelta(minutes=1), end, freq="min")
     values = {}
     for row in rows:
         at = stamp(row["timestamp"])
@@ -94,9 +185,26 @@ def bars(rows, start, now, *, index=False):
         if at in values and values[at] != current:
             raise ValueError("Conflicting duplicate candle")
         values[at] = current
-    if len(expected) < 20 or set(values) != set(expected):
-        raise ValueError("Opening data or completed 5m bars missing (minimum 20 minutes)")
+    coverage = candle_coverage(values, start, now, minimum_minutes, allow_opening_gap=index)
+    if coverage["code"] not in {"complete", "opening-gap"}:
+        raise CandleDataError(coverage)
     frame = pd.DataFrame.from_dict(values, orient="index", columns=["open", "high", "low", "close", "volume"]).sort_index()
+    return frame, coverage
+
+
+def market_reference(rows, start, now):
+    """Index return from actual minute OHLC, never a fabricated opening bar."""
+    frame, coverage = _minute_frame(rows, start, now, index=True)
+    basis = frame.index[0].to_pydatetime() - timedelta(minutes=1)
+    partial = coverage["acceptedOpeningGap"]
+    return {"return": float(frame.close.iloc[-1] / frame.open.iloc[0] - 1),
+            "basisStart": basis.isoformat(), "firstBarEnd": frame.index[0].isoformat(),
+            "barEnd": frame.index[-1].isoformat(), "openingGap": partial,
+            "warning": (f"지수 개장 첫 1분 누락: {basis.isoformat()} 첫 실제 관측 봉 시가 기준, 첫 1분 변동 미반영" if partial else None)}
+
+
+def bars(rows, start, now, *, index=False, minimum_minutes=20):
+    frame, coverage = _minute_frame(rows, start, now, index=index, minimum_minutes=minimum_minutes)
     typical = (frame.high + frame.low + frame.close) / 3
     turnover = float((typical * frame.volume).sum())
     volume = float(frame.volume.sum())
@@ -104,6 +212,8 @@ def bars(rows, start, now, *, index=False):
         raise ValueError("No session volume")
     five = frame.resample("5min", origin=start, closed="right", label="right").agg(
         {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+    if coverage["acceptedOpeningGap"]:
+        five = five.iloc[1:]  # Never present the incomplete opening group as a complete 5m bar.
     return five, turnover, turnover / volume if volume else 0
 
 
@@ -125,10 +235,12 @@ def evaluate_entry(symbol, rows, book, markets, start, now, settings):
     previous_close = five.close.shift(1)
     tr = pd.concat([five.high - five.low, (five.high - previous_close).abs(), (five.low - previous_close).abs()], axis=1).max(axis=1)
     atr = number(str(tr.tail(14).mean()))
-    returns = {}
+    returns, references, warnings = {}, {}, []
     for market in ("KOSPI", "KOSDAQ"):
-        index_bars, _, _ = bars(markets[market], start, now, index=True)
-        returns[market] = float(index_bars.close.iloc[-1] / index_bars.open.iloc[0] - 1)
+        references[market] = market_reference(markets[market], start, now)
+        returns[market] = references[market]["return"]
+        if references[market]["warning"]:
+            warnings.append(market + ": " + references[market]["warning"])
     reasons = []
     def require(condition, reason):
         if not condition:
@@ -141,9 +253,24 @@ def evaluate_entry(symbol, rows, book, markets, start, now, settings):
     require(abs(ask / number(str(last.close)) - 1) <= number(cfg["max_entry_extension"]), "신호 가격 이탈 / 추격 매수 차단")
     if cfg["entry_strategy"] == "breakout":
         require(last.close > five.high.iloc[-4:-1].max(), "직전 15분 고점 돌파 미확인")
+    elif cfg["entry_strategy"] == "opening_range":
+        minutes = int(cfg["opening_range_minutes"])
+        if minutes < 5 or minutes > 60 or minutes % 5:
+            raise ValueError("Opening range must be 5-60 minutes in 5-minute steps")
+        opening_end = start + timedelta(minutes=minutes)
+        opening = five.loc[five.index <= opening_end]
+        require(five.index[-1] > opening_end, "장 초반 범위 형성 중")
+        require(last.close > opening.high.max() and prior.close <= opening.high.max(),
+                "장 초반 고점의 신규 돌파 미확인")
     elif cfg["entry_strategy"] == "pullback":
         require(last.low <= vwap <= last.close and last.close > prior.close and last.close > last.open,
                 "VWAP 눌림목 회복 미확인")
+    elif cfg["entry_strategy"] == "vwap_reclaim":
+        # Compare each close against the VWAP known at that bar, not today's later VWAP.
+        previous_rows = [row for row in rows if stamp(row["timestamp"]) <= five.index[-2]]
+        _, _, previous_vwap = bars(previous_rows, start, five.index[-2].to_pydatetime(), minimum_minutes=15)
+        require(prior.close <= previous_vwap and last.close > vwap and last.close > last.open,
+                "VWAP 하단에서 상단으로의 재돌파 미확인")
     else:
         raise ValueError("Unknown entry strategy")
     # ATR/previous-low stop is capped at the configured maximum loss distance.
@@ -158,7 +285,8 @@ def evaluate_entry(symbol, rows, book, markets, start, now, settings):
             "barEnd": five.index[-1].isoformat(), "ask": str(ask), "bid": str(bid),
             "stopPrice": str(stop), "stopFraction": str(distance), "atr": str(atr),
             "vwapEstimate": vwap, "turnoverEstimate": turnover, "relativeVolume": relative,
-            "spread": str(spread), "marketReturns": returns, "rewardRisk": str(ratio), "strategy": cfg["entry_strategy"]}
+            "spread": str(spread), "marketReturns": returns, "marketReferences": references,
+            "warnings": warnings, "rewardRisk": str(ratio), "strategy": cfg["entry_strategy"]}
 
 
 def size_entry(plan, signal, settings):

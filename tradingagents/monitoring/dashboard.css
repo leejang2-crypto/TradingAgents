@@ -34,6 +34,17 @@ details > summary { cursor: pointer; padding: 8px 0; font-size: 14px; overflow-w
 #local-summary-panel article { border-top: 1px solid #e2e6eb; padding: 8px 0; }
 #local-summary-panel blockquote { margin: 10px 0; border-left: 3px solid #147669; padding-left: 12px; }
 .local-summary-warning { color: #a52d39; }
+.summary-objective { margin: 12px 0; padding: 4px 0 8px; border-bottom: 1px solid #c9d0dc; }
+.summary-objective ul { margin: 8px 0; padding-left: 20px; }
+.summary-objective li { margin: 6px 0; line-height: 1.6; overflow-wrap: anywhere; }
+.entry-watch-row { display: flex; align-items: center; gap: 10px; }
+.entry-watch-row span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+[data-live="candidates"] table { min-width: 1000px; }
+[data-live="candidates"] td:last-child { min-width: 280px; }
+.candidate-scroll { max-width: 100%; overflow-x: auto; }
+.auto-run-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+#auto-run-mode, #auto-run-state, #auto-run-message { overflow-wrap: anywhere; }
+.entry-watch-row button { flex: 0 0 36px; width: 36px; height: 36px; padding: 0; font-size: 22px; }
 [data-summary-link] { color: #126b5d; text-decoration: underline; text-underline-offset: 3px; }
 [data-summary-link] code { color: inherit; }
 #summary-dialog { box-sizing: border-box; width: 960px; max-width: calc(100% - 24px); max-height: calc(100dvh - 24px); padding: 20px; }

@@ -93,6 +93,8 @@ def test_no_news_match_or_news_failure_never_uses_default_ticker(setup, monkeypa
 
 @pytest.mark.parametrize("execute", [False, True])
 def test_valid_candidates_reach_same_paper_and_live_pipeline(setup, monkeypatch, execute):
+    monkeypatch.setattr(main, "screen_candidate_snapshot", lambda args, snapshot: {
+        **snapshot, "candidates": [{**row, "intraday": {"eligible": True}} for row in snapshot["candidates"]]})
     path, snapshot = setup
     snapshot.update(asOf="2025-01-01", checkedOn="2025-01-02")
     write_json(path, snapshot)

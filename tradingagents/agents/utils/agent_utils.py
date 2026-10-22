@@ -1,6 +1,7 @@
 import functools
 import logging
 from collections.abc import Mapping
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import yfinance as yf
@@ -67,7 +68,7 @@ def get_language_instruction() -> str:
 
 
 def get_trading_objective_instruction() -> str:
-    """Return the configured trading objective for decision-stage prompts."""
+    """Return the run's objective without imposing intraday rules on other research."""
     from tradingagents.dataflows.config import get_config
 
     objective = get_config().get("trading_objective") or {}
@@ -83,7 +84,7 @@ def get_trading_objective_instruction() -> str:
     parts = [
         "**Trading Objective:**",
         f"- Style: {style or 'intraday'}",
-        f"- Paper capital: {capital or 'unknown'} KRW",
+        f"- Strategy capital: {capital or 'unknown'} KRW",
         f"- Per-position gross price target return: {target_return or 'unknown'} (before costs)",
         "- No daily account profit quota. Do not force trades to meet a daily target.",
         f"- Maximum position stop distance: {objective.get('position_stop_loss') or 'unknown'}",
@@ -93,6 +94,25 @@ def get_trading_objective_instruction() -> str:
     ]
     if risk_note:
         parts.append(f"- Risk discipline: {risk_note}")
+    if not objective:
+        parts = []
+    if str(style or "").startswith("intraday"):
+        try:
+            percent = Decimal(str(target_return)) * 100
+            target_label = f"{percent.normalize():f}%" if percent.is_finite() else "unconfirmed"
+        except (InvalidOperation, ValueError):
+            target_label = "unconfirmed"
+        parts.extend([
+            "**Intraday decision contract (takes priority over generic rating examples):**",
+            f"- Aim to buy and sell within the same trading day, targeting +{target_label} gross price return per position, not account-wide daily profit.",
+            "- For BUY, explain the same-day catalyst, verified entry trigger, liquidity, target feasibility and invalidation/stop condition. Multi-month valuation is background, not a sufficient entry reason.",
+            f"- Take-profit rule: actual average entry price * (1 + {target_return}); stop distance must respect the configured limit. Do not invent live prices or promise a fill.",
+            f"- Stop new entries at {objective.get('buy_cutoff', 'the configured cutoff')}; start liquidation at {objective.get('liquidation_start', 'the configured liquidation time')} Asia/Seoul, even if the profit target has not been reached. Market close: {objective.get('market_close', 'configured close')}.",
+            "- HOLD with no shares means no entry this round: specify the unmet trigger, missing data or risk/reward problem. HOLD with shares never cancels stop-loss, take-profit or scheduled liquidation.",
+            "- No automatic overnight extension while waiting for profit. Only explicit user approval allows at most two trading sessions including acquisition day.",
+            "- Your final summary/action plan must state the configured target, entry or no-entry reason, stop/exit rule and same-day horizon. Distinguish policy targets from observed evidence and actual execution.",
+            "- If evidence is insufficient, choose HOLD or REVIEW rather than inventing a setup or forcing a trade.",
+        ])
     account = get_config().get("account_context")
     if isinstance(account, Mapping) and account.get("mode") == "dry-run":
         parts.extend([

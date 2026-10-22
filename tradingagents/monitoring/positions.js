@@ -38,7 +38,32 @@
       });
       if (!rows.length) { const row = document.createElement('tr'); const cell = text('td', '관리 중인 보유분 없음'); cell.colSpan = 9; row.append(cell); rows.push(row); }
       el('positions-body').replaceChildren(...rows);
-      el('entry-checks').replaceChildren(...Object.entries(data.entryChecks || {}).map(([symbol, check]) => text('p', symbol + ' · ' + (check.allowed ? '분봉 진입 조건 통과' : '매수 보류: ' + (check.reasons || []).join(', ')) + ' · ' + check.at)));
+      el('entry-checks').replaceChildren(...Object.entries(data.entryChecks || {}).map(([symbol, check]) => text('p', symbol + ' · ' + (check.allowed ? '분봉 진입 조건 통과' : '매수 보류: ' + (check.reasons || []).join(', ')) + ' · ' + check.at + ((check.warnings || []).length ? ' · 주의: ' + check.warnings.join('; ') : ''))));
+      const watchLabels = {waiting: '조건 대기', checking: '재점검 중', submitted: '주문 제출 처리', cancelled: '감시 종료'};
+      const watches = Object.values(data.entryWatches || {}).map(watch => {
+        const row = document.createElement('p');
+        row.className = 'entry-watch-row';
+        row.append(text('span', `${watch.symbol} · ${watchLabels[watch.status] || watch.status} · ${watch.reason || ''} · 만료 ${watch.expiresAt} · 재점검 ${watch.attempts || 0}회`));
+        if (['waiting', 'checking'].includes(watch.status)) {
+          const cancel = text('button', '×'); cancel.type = 'button';
+          cancel.title = '이 종목 매수 감시 취소'; cancel.setAttribute('aria-label', watch.symbol + ' 매수 감시 취소');
+          cancel.addEventListener('click', async () => {
+            editing = true; cancel.disabled = true;
+            let errorMessage = '';
+            try {
+              const response = await fetch('/api/positions/watch-cancel', {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Requested-With': 'TradingAgents'}, body: JSON.stringify({symbol: watch.symbol, id: watch.id})});
+              const result = await response.json(); if (!response.ok) throw new Error(result.error);
+            } catch (error) { errorMessage = error.message; }
+            finally {
+              editing = false; await refresh();
+              if (errorMessage) el('positions-warning').textContent = errorMessage;
+            }
+          });
+          row.append(cancel);
+        }
+        return row;
+      });
+      el('entry-watches').replaceChildren(...(watches.length ? watches : [text('p', '매수 조건 대기 후보 없음')]));
       el('positions-warning').textContent = [data.error, data.journalError ? '보조 주문 로그 기록 오류: ' + data.journalError : '', data.valuationError ? '시세/평가 미확인: ' + data.valuationError : '', (data.unconfirmed || []).length ? '접수 불확실 주문: 신규 주문 차단' : '', Object.keys(data.unmanaged || {}).length ? '자동 관리 제외 보유분: ' + Object.entries(data.unmanaged).map(([s, q]) => s + ' ' + q + '주').join(', ') : ''].filter(Boolean).join(' · ');
       const orders = Object.values(data.orders || {}).slice(-30).reverse().map(o => {
         const row = document.createElement('tr');

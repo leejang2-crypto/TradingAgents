@@ -47,8 +47,9 @@ from tradingagents.llm_clients.routing import AGENT_LABELS, DEEP_AGENTS, LLM_DEF
 from tradingagents.monitoring.auth import DashboardAuth, LoginError
 from tradingagents.monitoring.summary import LocalSummaryService, with_report_evidence
 from tradingagents.monitoring.control import BusyError, RunController, RunStopped, checkpoint, scheduled_job
-from tradingagents.brokers.position_risk import PositionRiskManager, RISK_DEFAULTS
-from tradingagents.brokers.intraday import INTRADAY_DEFAULTS, DECIMAL_LIMITS, INTEGER_LIMITS
+from tradingagents.brokers.position_risk import PositionRiskManager, RISK_DEFAULTS, BrokerBackend
+from tradingagents.brokers.candidate_screen import screen_candidates
+from tradingagents.brokers.intraday import INTRADAY_DEFAULTS, DECIMAL_LIMITS, INTEGER_LIMITS, ENTRY_STRATEGIES
 from tradingagents.research.service import ResearchBusy, ResearchService
 from tradingagents.research.universe import UniverseError, validate_snapshot as validate_universe
 
@@ -233,7 +234,7 @@ def make_parser() -> argparse.ArgumentParser:
         parser.add_argument("--" + key.replace("_", "-"), type=int, default=value)
     for key, value in INTRADAY_DEFAULTS.items():
         parser.add_argument("--" + key.replace("_", "-"), type=int if key in INTEGER_LIMITS else str, default=value,
-                            **({"choices": ["breakout", "pullback"]} if key == "entry_strategy" else {}))
+                            **({"choices": list(ENTRY_STRATEGIES)} if key == "entry_strategy" else {}))
     parser.add_argument(
         "--skip-news-collection",
         action="store_true",
@@ -571,8 +572,8 @@ def validate_trading_settings(settings: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError(f"{key} must be between {low} and {high}.")
             cleaned[key] = str(numeric)
         elif key == "entry_strategy":
-            if value not in {"breakout", "pullback"}:
-                raise ValueError("entry_strategy must be breakout or pullback.")
+            if value not in ENTRY_STRATEGIES:
+                raise ValueError("Unknown entry_strategy.")
             cleaned[key] = value
         elif key in RISK_DEFAULTS or key in INTEGER_LIMITS:
             if isinstance(value, bool) or not re.fullmatch(r"[0-9]+", str(value)):
@@ -580,6 +581,8 @@ def validate_trading_settings(settings: dict[str, Any]) -> dict[str, Any]:
             limits = INTEGER_LIMITS.get(key, (10, 300) if key == "position_check_seconds" else (5, 120))
             if not limits[0] <= int(value) <= limits[1]:
                 raise ValueError(f"{key} must be between {limits[0]} and {limits[1]}.")
+            if key == "opening_range_minutes" and int(value) % 5:
+                raise ValueError("opening_range_minutes must use 5-minute steps.")
             cleaned[key] = int(value)
         elif key == "provider":
             if not isinstance(value, str) or value not in {"openai", "ollama", "hybrid"}:
@@ -831,10 +834,21 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
             "max_entry_extension": "분봉 신호 대비 가격 이탈 한도",
             "stagnation_minutes": "정체 종목 청산 시간 (분)",
             "max_consecutive_stops": "일일 연속 손절 제한 (회)",
+            "opening_range_minutes": "장 초반 범위 (분, 5분 단위)",
+            "entry_watch_minutes": "매수 후보 감시 유효시간 (분, 0=감시 안 함)",
         }.items()
     )
     candidate_rows = []
     for row in (candidates.get("candidates") or [])[:10]:
+        intraday = row.get("intraday") or {}
+        metrics = intraday.get("metrics") or {}
+        screen_text = ("통과" if intraday.get("eligible") else "; ".join(intraday.get("reasons", []))) if intraday else "미평가"
+        metric_text = (
+            f"거래량 {metrics['relativeVolume']:.2f}배 · 거래대금 {metrics['turnoverEstimate'] / 1e8:.1f}억 · "
+            f"시장 대비 {metrics['relativeStrength'] * 100:+.2f}%p · ATR {metrics['atrFraction'] * 100:.2f}%"
+        ) if metrics else "-"
+        if metrics.get("comparisonStart"):
+            metric_text += f" · 비교 기준 {metrics['comparisonStart']}"
         candidate_rows.append(
             "<tr>"
             f"<td>{_compact_text(row.get('ticker'))}</td>"
@@ -843,6 +857,8 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
             f"<td>{_compact_text(row.get('mentionCount'))}</td>"
             f"<td>{_compact_text(row.get('positiveSignalCount'))}</td>"
             f"<td>{_compact_text(row.get('riskSignalCount'))}</td>"
+            f"<td>{_compact_text(intraday.get('score'))}</td>"
+            f"<td>{_compact_text(screen_text)}<br>{_compact_text(metric_text)}</td>"
             "</tr>"
         )
     live = snapshot.get("executionMode") == "live"
@@ -1096,6 +1112,15 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
         <ul id="research-failures"></ul>
       </div>
     </section>
+    <section id="auto-run-panel">
+      <h2>자동 매매</h2>
+      <div class="auto-run-toolbar">
+        <button id="auto-run-once" type="button" data-action="trade" disabled title="저장된 설정으로 후보 선정부터 분석·조건부 매매까지 한 회차 실행">자동실행 (1회)</button>
+        <span id="auto-run-mode">실행기 연결 확인 중</span>
+      </div>
+      <p id="auto-run-state" role="status">실행 상태 확인 중</p>
+      <p id="auto-run-message" class="message" role="status"></p>
+    </section>
     <section id="manual-panel">
       <h2>수동 실행</h2>
       <div class="control-toolbar">
@@ -1139,6 +1164,7 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
       <p class="muted">매수일 포함 최대 2거래일. 자동 분석을 일시정지해도 보유 점검·청산은 계속됩니다.</p>
       <div class="account-scroll"><table><thead><tr><th>종목</th><th>관리 수량</th><th>평균 매입가</th><th>종목 수익률</th><th>익절가 / 손절가</th><th>매수일</th><th>최종 보유 한도</th><th>다음 거래일까지 이월 허용</th><th>청산 상태</th></tr></thead><tbody id="positions-body"></tbody></table></div>
       <details data-detail-key="entry-checks"><summary>종목별 진입 검사</summary><div id="entry-checks"></div></details>
+      <details data-detail-key="entry-watches" open><summary>매수 조건 대기 후보</summary><div id="entry-watches"></div></details>
       <p id="positions-warning" role="status"></p>
       <details id="position-adoption" hidden><summary>기존 실계좌 보유분 편입</summary>
         <form id="position-adopt-form">
@@ -1238,7 +1264,7 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
         </details>
         <details class="settings-group" data-detail-key="settings-intraday" open><summary>단타 매매 기준</summary>
         <div class="form-grid">
-          <label>분봉 진입 전략<select name="entry_strategy">{options({'breakout': '15분 고점 돌파', 'pullback': 'VWAP 눌림목 회복'}, settings['entry_strategy'])}</select></label>
+          <label>분봉 진입 전략<select name="entry_strategy">{options(ENTRY_STRATEGIES, settings['entry_strategy'])}</select></label>
           {intraday_controls}
         </div>
         </details>
@@ -1277,10 +1303,11 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
     <section data-live="candidates">
       <h2>Candidate Ranking</h2>
       <p>{_compact_text(candidate_scope)}</p>
+      <p class="muted">시장평가: {_compact_text((candidates.get('intradayScreen') or {}).get('status'), '미평가')} · 기준 시각: {_compact_text((candidates.get('intradayScreen') or {}).get('asOf'))}</p>
       <p role="status">{_compact_text(candidates.get('selectionReason') or candidates.get('error'), '')}</p>
       {''.join('<p class="muted">' + _compact_text(warning) + '</p>' for warning in (candidates.get('warnings') or []))}
-      <table><thead><tr><th>Ticker</th><th>Name</th><th>Score</th><th>Mentions</th><th>Positive</th><th>Risk</th></tr></thead>
-      <tbody>{''.join(candidate_rows) or '<tr><td colspan="6">No candidates yet</td></tr>'}</tbody></table>
+      <div class="candidate-scroll"><table><thead><tr><th>Ticker</th><th>Name</th><th>뉴스 점수</th><th>Mentions</th><th>Positive</th><th>Risk</th><th>단타 점수</th><th>시장자료 평가</th></tr></thead>
+      <tbody>{''.join(candidate_rows) or '<tr><td colspan="8">No candidates yet</td></tr>'}</tbody></table></div>
       <details data-detail-key="candidate-path"><summary>후보 파일 경로</summary><p><code>{_compact_text(snapshot.get("latestCandidatePath"))}</code></p></details>
     </section>
     <section data-live="trades">
@@ -1430,7 +1457,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
     def _post(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path not in {"/api/analysis-summary/local", "/api/settings", "/api/account/refresh", "/api/login", "/api/logout", "/api/control/run", "/api/control/pause", "/api/control/cancel-pending", "/api/positions/carry", "/api/positions/adopt", "/api/research/run", "/api/research/stop", "/api/research/universe"}:
+        if parsed.path not in {"/api/positions/watch-cancel", "/api/analysis-summary/local", "/api/settings", "/api/account/refresh", "/api/login", "/api/logout", "/api/control/run", "/api/control/pause", "/api/control/cancel-pending", "/api/positions/carry", "/api/positions/adopt", "/api/research/run", "/api/research/stop", "/api/research/universe"}:
             self.send_error(404)
             return
         if parsed.path != "/api/login" and not self._authorized():
@@ -1482,11 +1509,15 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json(202, {"ok": True, **state})
                 return
-            if parsed.path in {"/api/positions/carry", "/api/positions/adopt"}:
+            if parsed.path in {"/api/positions/carry", "/api/positions/adopt", "/api/positions/watch-cancel"}:
                 risk = getattr(self.server, "risk", None)
                 if not isinstance(risk, PositionRiskManager):
                     raise ValueError("보유 관리 실행기가 없습니다.")
-                if parsed.path.endswith("/carry"):
+                if parsed.path.endswith("/watch-cancel"):
+                    if not isinstance(payload.get("symbol"), str) or not isinstance(payload.get("id"), str):
+                        raise ValueError("감시 후보와 ID가 필요합니다.")
+                    risk.entry_watch.cancel(payload["symbol"], "사용자 감시 취소", expected_id=payload["id"])
+                elif parsed.path.endswith("/carry"):
                     risk.carry(payload.get("symbol"), payload.get("cycle"), payload.get("allowed"))
                 else:
                     risk.adopt(payload.get("symbol"), payload.get("acquiredDate"), payload.get("confirmed"))
@@ -1527,6 +1558,9 @@ class MonitorHandler(BaseHTTPRequestHandler):
                         ):
                             raise ValueError("매매 실행은 설정된 정규장 시간에만 가능합니다.")
                         state = control.submit(payload, settings)
+                    risk = getattr(self.server, "risk", None)
+                    if isinstance(risk, PositionRiskManager) and (state.get("paused") or state.get("stopRequested")):
+                        risk.entry_watch.cancel(reason="사용자 일시정지/중단")
                 except BusyError as exc:
                     self._send_json(409, {"ok": False, "error": str(exc), "control": control.snapshot()})
                     return
@@ -1541,6 +1575,9 @@ class MonitorHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": True})
                 return
             saved = save_trading_settings(payload)
+            risk = getattr(self.server, "risk", None)
+            if isinstance(risk, PositionRiskManager):
+                risk.entry_watch.cancel(reason="사용자 설정 저장: 재분석 필요")
         except (ValueError, TypeError, ArithmeticError) as exc:
             self._send_json(400, {"ok": False, "error": str(exc)})
             return
@@ -1671,6 +1708,8 @@ def daily_profit_target(args: argparse.Namespace) -> Decimal:
 
 
 def trading_objective(args: argparse.Namespace) -> dict[str, str]:
+    market_close = getattr(args, "market_close", DEFAULT_MARKET_CLOSE)
+    close = datetime.strptime(market_close, "%H:%M")
     return {
         "style": args.trading_style,
         "capital_krw": str(Decimal(args.paper_capital).quantize(Decimal("1"))),
@@ -1679,6 +1718,11 @@ def trading_objective(args: argparse.Namespace) -> dict[str, str]:
         "position_stop_loss": str(getattr(args, "position_stop_loss", "0.005")),
         "daily_loss_limit": str(getattr(args, "daily_loss_limit", "0.02")),
         "per_trade_budget_krw": str(order_budget(args)),
+        "market_close": market_close,
+        "liquidation_start": (close - timedelta(minutes=int(getattr(args, "liquidation_minutes", 15)))).strftime("%H:%M"),
+        "buy_cutoff": (close - timedelta(minutes=int(getattr(args, "buy_cutoff_minutes", 30)))).strftime("%H:%M"),
+        "overnight_policy": "explicit-approval-only",
+        "max_holding_sessions": "2",
         "holding_period": "Same-day liquidation by default. Only explicit user approval permits one overnight hold; liquidate by the second trading session including acquisition day. HOLD never authorizes an extension.",
         "risk_note": (
             "This is a trading objective, not a guarantee. Agents should "
@@ -1832,7 +1876,8 @@ def collect_candidate_snapshot(args: argparse.Namespace) -> dict[str, Any]:
             sort="date",
             extra_queries=extra_queries,
         )
-        candidates = rank_candidate_tickers(articles, symbol_map=universe["members"], limit=args.candidate_limit)
+        candidates = rank_candidate_tickers(articles, symbol_map=universe["members"], limit=args.candidate_limit,
+                                           as_of=datetime.now(KOREA_TZ))
         ok = True
         error = None
     except RunStopped:
@@ -1961,6 +2006,9 @@ async def run_korea_toss(args: argparse.Namespace, *, execute: bool) -> dict[str
         raise SystemExit(
             "실제 Toss 주문은 --scenario auto-live 또는 korea-execute 와 --yes 를 함께 지정해야 실행됩니다."
         )
+    risk = getattr(args, "_position_manager", None)
+    if isinstance(risk, PositionRiskManager):
+        await asyncio.to_thread(risk.entry_watch.cancel, args.korea_ticker.split(".")[0], "새 분석 시작")
 
     quick_model, deep_model, backend_url = resolve_models(args)
     collected_news = collect_korea_news_snapshot(args)
@@ -2024,7 +2072,8 @@ async def run_korea_toss(args: argparse.Namespace, *, execute: bool) -> dict[str
             store.event(run_id, stage, {"plan": plan.__dict__, "fillVerified": False})
             risk = getattr(args, "_position_manager", None)
             if risk:
-                execution = await asyncio.to_thread(risk.execute, plan, run_id)
+                executor = risk.execute_with_watch if args.run_mode == "daily-market" else risk.execute
+                execution = await asyncio.to_thread(executor, plan, run_id)
             else:
                 execution = await execute_plan(
                     plan, execute=execute,
@@ -2087,6 +2136,45 @@ async def run_auto_live(args: argparse.Namespace) -> dict[str, Any]:
     return summary
 
 
+def screen_candidate_snapshot(args, snapshot):
+    settings = {key: getattr(args, key, value) for key, value in INTRADAY_DEFAULTS.items()}
+    settings.update(market_open=args.market_open, market_close=args.market_close,
+                    holiday_dates=args.holiday_dates, buy_cutoff_minutes=args.buy_cutoff_minutes)
+    risk = getattr(args, "_position_manager", None)
+    backend = risk.backend if isinstance(risk, PositionRiskManager) else BrokerBackend(LOCAL_DIR, False, args.paper_capital)
+    screening = screen_candidates(snapshot["candidates"], backend, settings, requested_date=args.date)
+    snapshot["candidates"] = screening.pop("rows")
+    snapshot["intradayScreen"] = screening
+    snapshot["warnings"] = list(dict.fromkeys([
+        *(snapshot.get("warnings") or []), *(screening.get("warnings") or []),
+    ]))
+    snapshot["selectionReason"] = screening["error"] or (None if screening["eligibleCount"] else "단타 시장자료 조건을 통과한 후보 없음; 신규 분석/주문 생략")
+    if screening["status"] == "failed":
+        snapshot["ok"] = False
+    if snapshot.get("jsonPath"):
+        path = Path(snapshot["jsonPath"])
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.update(candidates=snapshot["candidates"], intradayScreen=screening,
+                       selectionReason=snapshot["selectionReason"], ok=snapshot["ok"],
+                       warnings=snapshot["warnings"])
+        atomic_write_json(path, payload)
+    if snapshot.get("markdownPath"):
+        path = Path(snapshot["markdownPath"])
+        lines = ["", "## Intraday Market Ranking", "", f"- As of: {screening['asOf']}",
+                 f"- Status: {screening['status']}", "- Heuristic score, not expected profit or success probability."]
+        reference = screening.get("marketReference")
+        if reference:
+            lines.append(f"- KOSPI / stock comparison window: {reference['basisStart']} to {reference['barEnd']}")
+        lines.extend(f"- Warning: {warning}" for warning in screening.get("warnings", []))
+        lines.extend(["", "| Ticker | News rank | Intraday score | Eligible | Reasons |", "|---|---:|---:|---|---|"])
+        for row in snapshot["candidates"]:
+            check = row["intraday"]
+            reason = "; ".join(check["reasons"]).replace("|", "/").replace("\n", " ")
+            lines.append(f"| {row['ticker']} | {row.get('newsRank', '-')} | {check['score']} | {check['eligible']} | {reason} |")
+        path.write_text(path.read_text(encoding="utf-8") + "\n".join(lines) + "\n", encoding="utf-8")
+    return snapshot
+
+
 async def run_auto_trading(args: argparse.Namespace, *, execute: bool) -> dict[str, Any]:
     checkpoint("candidate-discovery")
     if execute and not args.yes:
@@ -2110,6 +2198,12 @@ async def run_auto_trading(args: argparse.Namespace, *, execute: bool) -> dict[s
                 raise UniverseError("코스피200 구성목록 밖의 후보가 포함되어 신규 분석/주문을 차단했습니다.")
         except (ValueError, KeyError, TypeError) as exc:
             selection_ok, selection_reason, candidates = False, str(exc), []
+    if selection_ok and candidates and args.trade_candidates > 0:
+        candidate_snapshot = await asyncio.to_thread(screen_candidate_snapshot, args, candidate_snapshot)
+        checkpoint("candidate-screened")
+        selection_ok = candidate_snapshot["ok"]
+        selection_reason = candidate_snapshot.get("selectionReason")
+        candidates = [row for row in candidate_snapshot["candidates"] if row["intraday"]["eligible"]] if selection_ok else []
     candidate_names = {row["ticker"]: row.get("name") for row in candidates}
     tickers = [row["ticker"] for row in candidates[: max(args.trade_candidates, 0)]]
     if not tickers and not selection_reason:
@@ -2133,6 +2227,7 @@ async def run_auto_trading(args: argparse.Namespace, *, execute: bool) -> dict[s
             try:
                 result = await run_korea_toss(args, execute=execute)
                 result["candidateRank"] = candidate_rank
+                result["candidateScreen"] = next((row.get("intraday") for row in candidates if row["ticker"] == ticker), None)
             except RunStopped:
                 raise
             except Exception as exc:
@@ -2451,6 +2546,13 @@ async def _main_async(args: argparse.Namespace) -> int:
         if args.scenario in AUTO_SCENARIOS and args.run_mode == "daily-market":
             control = RunController(live=args.scenario == "auto-live", audit_path=LOCAL_DIR / "monitor/manual_runs.jsonl")
             args._controller = control
+            if risk:
+                def watch_guard():
+                    state = control.snapshot()
+                    if state["paused"] or state["stopRequested"]:
+                        return "cancel"
+                    return "wait" if state["active"] or state["pending"] else "ready"
+                risk.entry_watch.guard = watch_guard
         monitor_server = start_monitor_server(args.monitor_host, args.monitor_port, scenario=args.scenario, control=control, risk=risk)
         monitor_url = getattr(monitor_server, "monitor_url", f"http://{args.monitor_host}:{args.monitor_port}")
         monitor_token = ensure_monitor_token()

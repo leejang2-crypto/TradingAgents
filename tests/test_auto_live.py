@@ -17,6 +17,8 @@ def live_args(monkeypatch, tmp_path):
 
 
 def test_live_and_paper_share_candidates_objective_and_analysis(live_args, monkeypatch):
+    monkeypatch.setattr(main, "screen_candidate_snapshot", lambda args, snapshot: {
+        **snapshot, "candidates": [{**row, "intraday": {"eligible": True}} for row in snapshot["candidates"]]})
     candidates = [{"ticker": "000660.KS"}, {"ticker": "035420.KS"}]
     universe = universe_snapshot()
     universe["members"].pop("000198.KS")

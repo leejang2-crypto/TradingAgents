@@ -4,6 +4,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_indicators,
     get_instrument_context_from_state,
     get_language_instruction,
+    get_trading_objective_instruction,
     get_stock_data,
     get_verified_market_snapshot,
 )
@@ -13,7 +14,7 @@ def create_market_analyst(llm):
 
     def market_analyst_node(state):
         current_date = state["trade_date"]
-        instrument_context = get_instrument_context_from_state(state)
+        instrument_context = get_instrument_context_from_state(state) + "\n" + get_trading_objective_instruction()
 
         tools = [
             get_stock_data,

@@ -22,6 +22,7 @@ from .paper_account import checked_quote, now_kst, number, KST
 from .toss_client import TossClient, OrderWindowClosed
 from .toss_executor import TossOrderPlan, record_paper_trade
 from .intraday import INTRADAY_DEFAULTS, evaluate_entry, session_candles, size_entry
+from .entry_watch import EntryWatch
 
 
 RISK_DEFAULTS = {"position_check_seconds": 30, "liquidation_minutes": 15, "buy_cutoff_minutes": 30}
@@ -174,6 +175,8 @@ class PositionRiskManager:
         self.stop_event = threading.Event()
         self.thread = None
         self.calendars = {}
+        self.entry_watch = EntryWatch(self)
+        self.entry_thread = None
 
     def _event(self, state, kind, **fields):
         state["events"].append({"at": self.clock().isoformat(), "kind": kind, **fields})
@@ -346,7 +349,7 @@ class PositionRiskManager:
         # A cancel acknowledgement is not proof that remaining shares did not fill.
         self.store.save(state)
 
-    def _submit(self, state, payload, reason, experience_id=None, entry_stop=None, entry_valid_until=None):
+    def _submit(self, state, payload, reason, experience_id=None, entry_stop=None, entry_valid_until=None, entry_watch_id=None):
         from tradingagents.monitoring.control import RunStopped
         key = payload["clientOrderId"]
         record = {"payload": payload, "status": "SUBMITTING", "createdAt": self.clock().isoformat(),
@@ -368,6 +371,8 @@ class PositionRiskManager:
                 deadline = min(deadline, entry_valid_until)
             if not window[0] <= self.clock() < deadline:
                 raise OrderWindowClosed("주문 제한 시간이 지났습니다.")
+            if entry_watch_id and not self.entry_watch.valid(state, payload["symbol"], entry_watch_id):
+                raise OrderWindowClosed("후보 감시가 취소되거나 변경되어 주문하지 않았습니다.")
             response = self.backend.submit(payload, self.clock(), valid_until=deadline)
             if not isinstance(response.get("orderId"), str) or not response["orderId"]:
                 raise ValueError("Missing order ID")
@@ -606,13 +611,24 @@ class PositionRiskManager:
                 state.update(error=f"보유 관리 점검 실패 ({type(exc).__name__}): {exc}", checkedAt=self.clock().isoformat())
                 self.store.save(state)
 
-    def execute(self, plan, experience_id=None):
+    def execute_with_watch(self, plan, experience_id=None):
+        self.entry_watch.cancel(plan.symbol, "새 분석 결과로 교체")
+        signature = self.entry_watch.signature(self.entry_watch.settings())
+        result = self.execute(plan, experience_id)
+        if result.get("skipped") == "intraday-filter":
+            watch = self.entry_watch.enqueue(plan, experience_id, signature)
+            if watch:
+                result["entryWatch"] = {key: watch[key] for key in ("id", "status", "expiresAt", "reason")}
+        return result
+
+    def execute(self, plan, experience_id=None, *, entry_watch_id=None):
         if plan.action == "REVIEW" or plan.rating == "REVIEW":
             return {"ok": False, "executed": False, "dryRun": not self.live,
                     "skipped": "decision-review", "plan": plan.__dict__}
         import re
         from tradingagents.monitoring.control import checkpoint
         signal, signal_error, signal_settings = None, None, None
+        signal_diagnostics = None
         if plan.action == "BUY":
             # Slow chart reads must not hold the position ledger lock and delay exits.
             try:
@@ -627,8 +643,12 @@ class PositionRiskManager:
                     signal_error = "정규장 매수 시간 밖"
             except Exception as exc:
                 signal_error = str(exc)
+                signal_diagnostics = getattr(exc, "diagnostics", None)
         with self.store.locked():
             state = self.store.load()
+            if entry_watch_id and not self.entry_watch.valid(state, plan.symbol, entry_watch_id):
+                self.store.save(state)
+                return {"executed": False, "dryRun": not self.live, "skipped": "watch-cancelled", "plan": plan.__dict__}
             self._tick(state, orders=False)
             checkpoint("position-risk-check")
             if plan.action == "HOLD":
@@ -650,8 +670,8 @@ class PositionRiskManager:
                     raise ValueError("매수 제한 시간, 일일 손실 제한 또는 평가자료 부족으로 신규 매수를 차단했습니다.")
                 if number(position.get("quantity", 0)) > 0:
                     raise ValueError("보유 종목 추가 매수 금지")
-                if not self.live and self.backend.holdings().get(symbol, Decimal(0)) > 0:
-                    raise ValueError("모의계좌 보유 종목 추가 매수 금지")
+                if self.backend.holdings().get(symbol, Decimal(0)) > 0:
+                    raise ValueError("계좌 보유 종목 추가 매수 금지")
                 if position.get("closedAt") and iso_time(position["closedAt"]).date() == now.date():
                     raise ValueError("당일 청산 종목 재진입 금지")
                 settings = {**INTRADAY_DEFAULTS, **self.settings()}
@@ -672,6 +692,12 @@ class PositionRiskManager:
                 except Exception as exc:
                     self._event(state, "entry-blocked", symbol=symbol, reason=str(exc))
                     state.setdefault("entryChecks", {})[symbol] = {"allowed": False, "at": self.clock().isoformat(), "reasons": [str(exc)]}
+                    if signal:
+                        for key in ("marketReturns", "marketReferences", "warnings"):
+                            if key in signal:
+                                state["entryChecks"][symbol][key] = signal[key]
+                    if signal_diagnostics:
+                        state["entryChecks"][symbol]["dataDiagnostics"] = signal_diagnostics
                     self.store.save(state)
                     return {"ok": True, "executed": False, "dryRun": not self.live, "plan": plan.__dict__,
                             "skipped": "intraday-filter", "entryCheck": state["entryChecks"][symbol]}
@@ -694,9 +720,13 @@ class PositionRiskManager:
             if not window or not window[0] <= self.clock() < window[1] or (plan.action == "BUY" and self.clock() >= iso_time(state["buyCutoffAt"])):
                 raise ValueError("Order window closed during validation")
             checkpoint("order-submitting")
+            if entry_watch_id and not self.entry_watch.valid(state, symbol, entry_watch_id):
+                self.store.save(state)
+                return {"executed": False, "dryRun": not self.live, "skipped": "watch-cancelled", "plan": plan.__dict__}
             order = self._submit(state, payload, "agent-decision", experience_id,
                                  entry_stop=signal["stopPrice"] if plan.action == "BUY" else None,
-                                 entry_valid_until=iso_time(signal["at"]) + timedelta(seconds=30) if plan.action == "BUY" else None)
+                                 entry_valid_until=iso_time(signal["at"]) + timedelta(seconds=30) if plan.action == "BUY" else None,
+                                 entry_watch_id=entry_watch_id)
             self._reconcile(state)
             self.store.save(state)
             order = state["orders"][payload["clientOrderId"]]
@@ -772,6 +802,9 @@ class PositionRiskManager:
     def snapshot(self):
         with self.store.locked():
             state = self.store.load()
+        state["entryWatches"] = {symbol: {key: row.get(key) for key in (
+            "id", "symbol", "status", "reason", "createdAt", "expiresAt", "lastCheckedAt", "attempts",
+        )} for symbol, row in state.get("entryWatches", {}).items()}
         return {**state, "mode": "live" if self.live else "dry-run", "maxTradingDays": 2, "enabled": True,
                 "goalReturn": self.settings().get("position_target_return", ".01"), "goalScope": "position",
                 "dailyLossLimit": self.settings().get("daily_loss_limit", ".02")}
@@ -787,8 +820,20 @@ class PositionRiskManager:
                 self.stop_event.wait(max(10, int(self.settings().get("position_check_seconds", 30))))
         self.thread = threading.Thread(target=loop, name="position-risk", daemon=True)
         self.thread.start()
+        def entries():
+            while not self.stop_event.is_set():
+                try:
+                    self.entry_watch.process()
+                except Exception:
+                    pass  # Fail closed; no order is sent without a valid persisted watch.
+                self.stop_event.wait(max(10, int(self.settings().get("position_check_seconds", 30))))
+        self.entry_thread = threading.Thread(target=entries, name="entry-watch", daemon=True)
+        self.entry_thread.start()
 
     def stop(self):
         self.stop_event.set()
         if self.thread:
             self.thread.join()
+        if self.entry_thread:
+            self.entry_thread.join()
+        self.entry_watch.cancel(reason="프로그램 종료: 재분석 필요")

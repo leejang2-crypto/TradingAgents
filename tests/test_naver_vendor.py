@@ -178,6 +178,28 @@ def test_rank_candidate_tickers_scores_positive_and_risk_mentions():
     assert ranked[0]["ticker"] == "005930.KS"
 
 
+def test_candidate_news_is_deduplicated_across_queries_with_risk_precedence():
+    base = {'title': '삼성전자', 'link': 'https://example.com/same', 'published_at': '2026-10-22T09:00'}
+    articles = [{**base, 'category': 'selection_signals', 'query': 'one'},
+                {**base, 'category': 'themes', 'query': 'two'}]
+    rows = naver_news.rank_candidate_tickers(articles)
+    assert rows[0]['mentionCount'] == 1 and rows[0]['score'] == 3
+    articles.append({**base, 'category': 'risk_signals', 'query': 'three'})
+    rows = naver_news.rank_candidate_tickers(articles)
+    assert rows[0]['mentionCount'] == 1 and rows[0]['score'] == -2
+
+
+def test_candidate_news_freshness_and_future_dates():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    as_of = datetime(2026, 10, 22, 10, tzinfo=ZoneInfo('Asia/Seoul'))
+    articles = [{'title': '삼성전자', 'category': 'selection_signals', 'link': str(i), 'published_at': at}
+                for i, at in enumerate(['2026-10-22T09:00', '2026-10-21T09:00', '2026-10-20T09:00',
+                                        '2026-10-22T11:00', None])]
+    row = naver_news.rank_candidate_tickers(articles, as_of=as_of)[0]
+    assert row['score'] == 3 + 1.5 + .75 + .75 and row['mentionCount'] == 4
+
+
 def test_naver_quota_ledger_blocks_before_exceeding_second_limit(tmp_path, monkeypatch):
     state_path = tmp_path / "quota.json"
     set_config(

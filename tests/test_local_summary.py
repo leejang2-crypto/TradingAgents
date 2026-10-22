@@ -29,6 +29,8 @@ def mock_ollama(monkeypatch, items):
 
 
 def test_local_summary_is_grounded_and_never_sends_account_or_paths(monkeypatch, content):
+    content['tradingObjective'] = {'style': 'intraday-scalping', 'position_target_return': '0.01',
+                                  'holding_period': 'Same-day liquidation by default.'}
     factory, client = mock_ollama(monkeypatch, [{"id": "0", "summary": "거래량 근거가 부족해 매수를 보류했습니다.",
                                                "evidenceIds": ["0:0"]}])
     result = summary.generate_summary(summary.source_material(content), {})
@@ -42,6 +44,10 @@ def test_local_summary_is_grounded_and_never_sends_account_or_paths(monkeypatch,
     assert "PRIVATE ACCOUNT" not in payload and "/private/report" not in payload
     assert client.post.call_args.kwargs["json"]["model"] == "qwen3:8b"
     assert client.post.call_args.kwargs["json"]["format"]["type"] == "object"
+    user_input = json.loads(client.post.call_args.kwargs['json']['messages'][1]['content'])
+    assert user_input['objective']['targetPercent'] == '1'
+    assert user_input['objective']['sameDay'] is True
+    assert user_input['rows'][0]['id'] == '0'
 
 
 @pytest.mark.parametrize("items", [[], [{"id": "wrong", "summary": "test", "evidenceIds": ["0:0"]}],

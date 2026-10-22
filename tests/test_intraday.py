@@ -6,7 +6,7 @@ import asyncio
 import pytest
 
 import main
-from tradingagents.brokers.intraday import bars, evaluate_entry, session_candles, size_entry
+from tradingagents.brokers.intraday import bars, evaluate_entry, session_candles, size_entry, CandleDataError
 from tradingagents.brokers.paper_account import KST
 from tradingagents.brokers.toss_client import TossClient
 from tradingagents.brokers.toss_executor import TossOrderPlan
@@ -101,6 +101,35 @@ def test_chasing_price_is_rejected(data):
     assert "신호 가격 이탈 / 추격 매수 차단" in check(data)["reasons"]
 
 
+def test_opening_range_uses_fixed_opening_window_and_new_cross(data):
+    assert check(data, entry_strategy='opening_range')['allowed']
+    assert not check(data, entry_strategy='opening_range', opening_range_minutes=30)['allowed']
+    # A later continuation above the same opening range is not a fresh breakout.
+    for row in data[0][10:15]:
+        row.update(openPrice='10020', highPrice='10040', lowPrice='10010', closePrice='10030')
+    result = check(data, entry_strategy='opening_range', opening_range_minutes=10)
+    assert not result['allowed'] and '장 초반 고점의 신규 돌파 미확인' in result['reasons']
+
+
+def test_vwap_reclaim_requires_previous_close_below_its_own_vwap(data):
+    assert check(data, entry_strategy='vwap_reclaim')['allowed']
+    for row in data[0][10:15]:
+        row.update(openPrice='10020', highPrice='10040', lowPrice='10010', closePrice='10030')
+    result = check(data, entry_strategy='vwap_reclaim')
+    assert not result['allowed'] and 'VWAP 하단에서 상단으로의 재돌파 미확인' in result['reasons']
+
+
+@pytest.mark.parametrize('strategy', ['opening_range', 'vwap_reclaim', 'breakout', 'pullback'])
+def test_new_strategy_settings_and_controls(strategy):
+    assert main.validate_trading_settings({'entry_strategy': strategy})['entry_strategy'] == strategy
+    assert main.make_parser().parse_args(['--entry-strategy', strategy]).entry_strategy == strategy
+    html = main.render_monitor_html({})
+    assert 'value="' + strategy + '"' in html
+    assert 'name="entry_watch_minutes"' in html and 'id="entry-watches"' in html
+    with pytest.raises(ValueError):
+        main.validate_trading_settings({'opening_range_minutes': 7})
+
+
 def test_candles_use_end_timestamps_and_opening_boundary(data):
     rows, _, _, start, now = data
     rows.insert(0, {**rows[0], "timestamp": start.isoformat(), "closePrice": "50000"})
@@ -130,8 +159,10 @@ def test_pagination_cannot_loop_forever(data):
     def call(*a, **kw):
         calls.append(kw)
         return {"candles": [rows[-1]], "nextBefore": rows[-1]["timestamp"]}
-    session_candles(call, "005930", start, now)
-    assert len(calls) == 2
+    with pytest.raises(CandleDataError) as error:
+        session_candles(call, "005930", start, now)
+    assert len(calls) == 3  # Two pagination calls plus one bounded gap repair.
+    assert error.value.diagnostics['paginationStop'] == 'cursor-not-moving'
 
 
 def test_market_indicator_start_times_are_normalized_to_end_times(data):

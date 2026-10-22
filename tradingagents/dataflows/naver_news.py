@@ -12,6 +12,7 @@ from datetime import datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import fcntl
 
@@ -550,15 +551,40 @@ def rank_candidate_tickers(
     *,
     symbol_map: dict[str, str] | None = None,
     limit: int = 20,
+    as_of: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Rank known Korean tickers mentioned in discovery news rows."""
     candidates = _candidate_symbol_map() if symbol_map is None else symbol_map
     aliases_by_symbol = candidate_symbol_aliases(candidates)
     scores: dict[str, dict[str, Any]] = {}
+    unique = {}
     for article in articles:
+        identity = article.get("link") or article.get("naver_link") or (
+            article.get("title", ""), article.get("published_at", ""))
+        prior = unique.get(identity)
+        category = article.get("category")
+        # One article can match many queries. Count once; risk takes precedence.
+        if prior is None or (prior.get("category") != "risk_signals" and (
+            category == "risk_signals" or _CANDIDATE_CATEGORY_WEIGHTS.get(category, 1) >
+            _CANDIDATE_CATEGORY_WEIGHTS.get(prior.get("category"), 1))):
+            unique[identity] = article
+    for article in unique.values():
         text = f"{article.get('title', '')} {article.get('description', '')}"
         category = str(article.get("category", "custom"))
         weight = _CANDIDATE_CATEGORY_WEIGHTS.get(category, 1)
+        freshness = 1.0
+        if as_of is not None:
+            try:
+                published = datetime.fromisoformat(article.get("published_at") or "")
+                if published.tzinfo is None:
+                    published = published.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+                age = (as_of - published).total_seconds() / 3600
+                if age < 0:
+                    continue
+                freshness = 1 if age <= 24 else .5 if age <= 48 else .25
+            except (TypeError, ValueError):
+                freshness = .25
+        weight *= freshness
         for code, name in candidates.items():
             base = _base_symbol(code)
             if not any(_mentions_alias(text, alias) for alias in aliases_by_symbol[code]):
@@ -593,6 +619,7 @@ def rank_candidate_tickers(
                         "title": article.get("title"),
                         "query": article.get("query"),
                         "category": category,
+                        "freshnessWeight": freshness,
                         "published_at": article.get("published_at"),
                         "link": article.get("link"),
                     }

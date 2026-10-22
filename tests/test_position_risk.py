@@ -175,6 +175,38 @@ def test_failed_or_stale_entry_evidence_blocks_without_order(env):
     assert manager.snapshot()["entryChecks"]["005930"]["reasons"] == ["no candles"]
 
 
+def test_candle_diagnostics_are_saved_without_sending_orders(env):
+    from tradingagents.brokers.intraday import CandleDataError, candle_coverage
+    manager, broker, clock, _ = env
+    details = candle_coverage([], clock[0].replace(hour=9, minute=0), clock[0])
+    details['symbol'] = 'KOSPI'
+    def missing(*args):
+        raise CandleDataError(details)
+    broker.entry_signal = missing
+    result = buy(manager)
+    assert result['skipped'] == 'intraday-filter' and not broker.orders
+    assert result['entryCheck']['dataDiagnostics']['symbol'] == 'KOSPI'
+    assert manager.snapshot()['entryChecks']['005930']['dataDiagnostics']['missingCount'] > 0
+
+
+@pytest.mark.parametrize('allowed', [False, True])
+def test_index_opening_warning_survives_final_entry_decision(env, allowed):
+    manager, broker, _, _ = env
+    original = broker.entry_signal
+    references = {'KOSPI': {'basisStart': '2026-09-15T09:01:00+09:00', 'openingGap': True}}
+    warnings = ['KOSPI: first minute unavailable; actual observed open used']
+    def signal(*args):
+        return {**original(*args), 'allowed': allowed, 'reasons': [] if allowed else ['market drop'],
+                'marketReturns': {'KOSPI': -.02 if not allowed else 0},
+                'marketReferences': references, 'warnings': warnings}
+    broker.entry_signal = signal
+    buy(manager)
+    saved = manager.snapshot()['entryChecks']['005930']
+    assert saved['allowed'] is allowed
+    assert saved['marketReferences'] == references and saved['warnings'] == warnings
+    assert bool(broker.orders) is allowed
+
+
 def test_no_pyramiding_or_same_day_reentry(env):
     manager, _, _, _ = env
     buy(manager)
@@ -385,8 +417,9 @@ def test_unrelated_live_holdings_are_not_adopted_or_sold(env):
 
 def test_unrelated_same_symbol_shares_are_not_sold(env):
     manager, broker, _, _ = env
-    broker.positions["005930"] = Decimal(23)
     buy(manager)
+    # Shares acquired outside the strategy after entry must remain untouched.
+    broker.positions["005930"] += Decimal(23)
     manager.execute(TossOrderPlan("SELL", "Sell", "005930", quantity="1"))
     assert broker.positions["005930"] == 23
 

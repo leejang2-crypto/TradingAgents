@@ -66,7 +66,7 @@ def create_portfolio_manager(llm):
 
 ---
 
-Be decisive and ground every conclusion in specific evidence from the analysts. For the configured intraday objective, approve BUY/SELL only when the setup has a plausible same-day path, clear risk controls, and liquidity suitable for the default per-trade budget.{get_language_instruction()}"""
+Be decisive and ground every conclusion in specific evidence from the analysts. For a configured intraday objective, its decision contract overrides the generic rating descriptions above. Approve BUY only when the setup has a plausible same-day path to the configured per-position target, clear risk controls, and liquidity suitable for the per-trade budget. SELL requires holdings; HOLD is valid for unmet entry conditions and never extends the holding deadline. Include the configured profit target and liquidation deadline in executive_summary and time_horizon even when the decision is HOLD. Label them as policy, not a guaranteed outcome.{get_language_instruction()}"""
 
         prompt += "\nStart with your own final decision on a separate English-labelled line: Rating: Buy / Overweight / Hold / Underweight / Sell. Do not substitute a quoted party's rating for your own."
         decision = invoke_typed(structured_llm, prompt, PortfolioDecision)

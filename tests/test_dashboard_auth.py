@@ -232,6 +232,59 @@ def test_position_management_writes_use_login_and_csrf_guard(server):
     server.risk.adopt.assert_called_once_with("005930", "2026-09-14", True)
 
 
+def test_watch_cancellation_requires_login_csrf_and_current_id(server):
+    server.risk = Mock(spec=PositionRiskManager)
+    server.risk.entry_watch = Mock()
+    server.risk.snapshot.return_value = {"enabled": True, "entryWatches": {}}
+    path = "/api/positions/watch-cancel"
+    payload = {"symbol": "005930", "id": "watch-id"}
+    assert request(server, "POST", path, payload)[0] == 401
+    cookie = login(server)
+    assert request(server, "POST", path, payload, cookie=cookie, extra={"Origin": "https://evil.test"})[0] == 403
+    assert request(server, "POST", path, {"symbol": "005930"}, cookie=cookie)[0] == 400
+    server.risk.entry_watch.cancel.assert_not_called()
+    assert request(server, "POST", path, payload, cookie=cookie)[0] == 200
+    server.risk.entry_watch.cancel.assert_called_once_with("005930", "사용자 감시 취소", expected_id="watch-id")
+    server.risk.entry_watch.cancel.side_effect = ValueError("stale watch")
+    assert request(server, "POST", path, payload, cookie=cookie)[0] == 400
+
+
+def test_settings_and_pause_cancel_waiting_entries(server):
+    server.risk = Mock(spec=PositionRiskManager)
+    server.risk.entry_watch = Mock()
+    cookie = login(server)
+    assert request(server, "POST", "/api/settings", {"entry_watch_minutes": 20}, cookie=cookie)[0] == 200
+    server.risk.entry_watch.cancel.assert_called_once()
+    server.risk.entry_watch.cancel.reset_mock()
+    assert request(server, "POST", "/api/control/pause", {"paused": True}, cookie=cookie)[0] == 202
+    server.risk.entry_watch.cancel.assert_called_once_with(reason="사용자 일시정지/중단")
+
+
+@pytest.mark.parametrize('live', [False, True])
+def test_auto_run_uses_saved_settings_auth_market_guard_and_live_confirmation(server, monkeypatch, live):
+    server.control = RunController(live=live)
+    payload = {'action': 'trade', 'requestId': 'a' * 32}
+    monkeypatch.setattr(main, 'is_regular_market_open', lambda *args, **kwargs: True)
+    assert request(server, 'POST', '/api/control/run', payload)[0] == 401
+    cookie = login(server)
+    assert request(server, 'POST', '/api/control/run', payload, cookie=cookie,
+                   extra={'Origin': 'https://evil.test'})[0] == 403
+    if live:
+        assert request(server, 'POST', '/api/control/run', payload, cookie=cookie)[0] == 400
+        assert server.control.pending is None
+        payload['confirmLive'] = True
+    monkeypatch.setattr(main, 'is_regular_market_open', lambda *args, **kwargs: False)
+    assert request(server, 'POST', '/api/control/run', payload, cookie=cookie)[0] == 400
+    assert server.control.pending is None
+    monkeypatch.setattr(main, 'is_regular_market_open', lambda *args, **kwargs: True)
+    assert request(server, 'POST', '/api/control/run', payload, cookie=cookie)[0] == 202
+    queued = server.control.snapshot()['pending']
+    assert queued['action'] == 'trade' and queued['settings'] == main.load_trading_settings()
+    assert queued['mode'] == ('live' if live else 'dry-run')
+    assert request(server, 'POST', '/api/control/run', payload, cookie=cookie)[0] == 202
+    assert server.control.snapshot()['pending']['id'] == queued['id']
+
+
 @pytest.mark.parametrize("settings", [
     {"position_check_seconds": 0}, {"position_check_seconds": 301}, {"liquidation_minutes": 0},
     {"buy_cutoff_minutes": 10, "liquidation_minutes": 15}, {"liquidation_minutes": True},

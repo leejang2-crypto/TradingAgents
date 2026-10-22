@@ -57,6 +57,7 @@
   move('[data-live="runtime"]', 'overview');
   move('[data-live="objective"]', 'overview');
   move('#positions-panel', 'overview');
+  move('#auto-run-panel', 'analysis');
   move('[data-live="analyses"]', 'analysis');
   move('[data-live="candidates"]', 'analysis');
   move('#research-panel', 'research');
@@ -129,6 +130,14 @@
     el('local-summary-status').textContent = `${labels[data.status] || ''}${sourceOnly ? ' (원문 표시 포함)' : ''} · ${data.model || ''}` + (data.error ? ` · ${data.error}` : '')
       + (data.generatedAt ? ` · ${new Date(data.generatedAt).toLocaleString()}` : '');
     const result = el('local-summary-result'); result.replaceChildren();
+    const objective = data.facts?.objective;
+    if (objective) {
+      const policy = document.createElement('div'); policy.className = 'summary-objective';
+      policy.append(text('h4', '분석 당시 매매 목표'));
+      const rules = document.createElement('ul');
+      (objective.lines || []).forEach(line => rules.append(text('li', line)));
+      policy.append(rules); result.append(policy);
+    }
     if (data.status !== 'completed') return;
     const facts = data.facts;
     result.append(text('p', `${facts.date || '날짜 미상'} · ${facts.executionMode === 'live' ? '실투자' : facts.executionMode === 'dry-run' ? '모의투자' : '모드 미상'} · 분석 ${facts.total}종목 · 원본 실행 상태: ${facts.ok === true ? '성공' : facts.ok === false ? '오류/미완료 포함' : '미상'}`));
@@ -141,6 +150,7 @@
       const article = document.createElement('article');
       article.append(text('h4', `${item.name} (${item.ticker})`));
       article.append(text('p', item.summary));
+      if (/^hold$/i.test(item.decision?.trim() || '')) article.append(text('p', 'HOLD: 이번 분석에서는 추가 매수·매도 행동을 제안하지 않음. 미보유 종목은 신규 진입 보류이며, 보유 종목의 익절·손절·청산 규칙은 계속 적용됩니다.', 'muted'));
       article.append(text('p', item.sourceKind === 'portfolio-report' ? '근거 자료: 상세 보고서의 최종 포트폴리오 판단' : '근거 자료: 분석 요약 파일의 판정/오류', 'muted'));
       if (item.warning) article.append(text('p', item.warning, 'local-summary-warning'));
       if (item.error) article.append(text('p', '원본 분석 오류: ' + item.error, 'local-summary-warning'));

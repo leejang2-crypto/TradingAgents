@@ -3,6 +3,7 @@
 from collections import OrderedDict
 from copy import deepcopy
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 from pathlib import Path
@@ -12,6 +13,51 @@ from urllib.parse import urlsplit
 import httpx
 
 from tradingagents.llm_clients.routing import LLM_DEFAULTS
+
+
+def saved_objective(content):
+    """Describe saved policy, never substitute today's settings for an old run."""
+    objective = content.get("tradingObjective")
+    if not isinstance(objective, dict) or not objective:
+        return {"available": False, "lines": ["분석 당시 목표 설정 기록 없음: 현재 설정으로 소급 해석하지 않습니다."]}
+
+    def percent(key):
+        try:
+            value = Decimal(str(objective.get(key)))
+            if value.is_finite() and 0 < value <= 1:
+                return f"{(value * 100).normalize():f}"
+        except (InvalidOperation, ValueError):
+            pass
+        return None
+
+    target, stop = percent("position_target_return"), percent("position_stop_loss")
+    holding = str(objective.get("holding_period") or "")
+    intraday = str(objective.get("style") or "").startswith("intraday")
+    same_day = intraday and "same-day" in holding.lower()
+    approval = objective.get("overnight_policy") == "explicit-approval-only" or "explicit user approval" in holding.lower()
+    lines = ["분석 당시 목표: " + ("당일 매수·당일 청산" if same_day else "보유 기간 원문 확인 필요")]
+    lines.append(f"종목별 익절 목표 +{target}% (수수료·세금·슬리피지 차감 전)" if target else "종목별 익절 목표: 기록 확인 필요")
+    if stop:
+        lines.append(f"기본 손절 한도 -{stop}% (진입 시 더 엄격한 손절 기준 적용 가능)")
+    if same_day:
+        lines.append("목표 미달이어도 청산 시각에 매도 시도. 체결을 보장하지 않으며 HOLD는 보유 연장 승인이 아닙니다.")
+    for field, label in (("buy_cutoff", "신규 매수 중단"), ("liquidation_start", "청산 시작"), ("market_close", "장 종료")):
+        value = objective.get(field)
+        if isinstance(value, str) and len(value) == 5:
+            try:
+                datetime.strptime(value, "%H:%M")
+            except ValueError:
+                continue
+            lines.append(f"{label}: {value} (한국시간)")
+    if not objective.get("liquidation_start"):
+        lines.append("청산 시작 시각: 이 과거 분석 파일에는 기록되지 않음")
+    if same_day and approval:
+        lines.append("익일 보유는 사용자 별도 승인 시에만 허용됩니다. 목표 미달만으로 자동 연장하지 않습니다.")
+        if objective.get("max_holding_sessions") == "2" or "second trading session including acquisition day" in holding:
+            lines.append("승인된 예외도 취득일 포함 최대 2거래일 이내 청산 대상입니다.")
+    lines.append("종목별 가격 목표이며 계좌 전체의 일일 수익률 보장이 아닙니다. 진입 조건 미충족 시 매수하지 않습니다.")
+    return {"available": True, "style": objective.get("style"), "targetPercent": target,
+            "stopPercent": stop, "sameDay": same_day, "lines": lines}
 
 
 def with_report_evidence(content, local_dir):
@@ -85,9 +131,11 @@ def source_material(content):
                      "name": str(row.get("name") or "-"), "source": decision[:1600],
                      "error": str(row.get("error") or "")[:1600],
                      "analysisOk": row.get("ok"), "plannedAction": plan.get("action"),
+                     "decision": str(row.get("decision") or ""),
                      "sourceKind": "portfolio-report" if row.get("portfolioEvidence") else "decision",
                      "fillVerified": toss.get("fillVerified") is True})
     return {"date": content.get("date"), "executionMode": content.get("executionMode"),
+            "objective": saved_objective(content),
             "ok": content.get("ok"), "total": len(analyses), "partial": truncated,
             "error": str(content.get("error") or ""),
             "selectionReason": str(content.get("selectionReason") or ""), "rows": rows}
@@ -138,6 +186,11 @@ def generate_summary(material, settings):
         "segments의 text만 근거로 한국어 1~2문장 summary(800자 이하)와 이를 뒷받침하는 "
         "segment id를 evidenceIds에 1~4개 선택하세요. 인용문을 생성하지 마세요. "
         "수치, 매수/매도 판단, 체결 여부를 새로 만들지 마세요. "
+        "objective는 분석 당시 설정된 목표이지 달성 사실이나 진입 신호가 아닙니다. "
+        "단타 목표가 기록되어 있으면 종목별 목표 수익과 당일 청산 원칙을 짧게 명시하고, "
+        "원문에서 확인되는 당일 진입/보류 이유와 위험을 중심으로 요약하세요. "
+        "장기 상승 전망만으로 단타 매수를 권하지 마세요. 목표나 가격이 원문에 없으면 "
+        "정책과 근거 미확인을 구분하세요. HOLD를 목표 포기 또는 익일 보유 승인으로 해석하지 마세요. "
         "불확실성, 오류, 위험을 생략하지 마세요. 모든 id를 정확히 한 번 포함하세요. "
         'JSON 형식: {"items":[{"id":"0","summary":"...","evidenceIds":["0:0"]}]}'
     )
@@ -147,7 +200,7 @@ def generate_summary(material, settings):
             "model": model, "stream": False, "format": schema, "think": False,
             "options": {"temperature": 0, "num_ctx": 8192, "num_predict": 2200},
             "messages": [{"role": "system", "content": prompt},
-                         {"role": "user", "content": json.dumps(list(pending.values()), ensure_ascii=False)}],
+                         {"role": "user", "content": json.dumps({"objective": material.get("objective"), "rows": list(pending.values())}, ensure_ascii=False)}],
         })
         response.raise_for_status()
         if len(response.content) > 100_000:
@@ -191,7 +244,7 @@ class LocalSummaryService:
     def request(self, content, settings, *, start=False):
         settings = {key: settings.get(key, LLM_DEFAULTS[key])
                     for key in ("ollama_base_url", "ollama_quick_model")}
-        key = hashlib.sha256(json.dumps([content, settings, 2], sort_keys=True,
+        key = hashlib.sha256(json.dumps([content, settings, 3], sort_keys=True,
                                        ensure_ascii=False).encode()).hexdigest()
         material = source_material(content)
         with self.lock:

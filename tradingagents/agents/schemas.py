@@ -82,9 +82,9 @@ class ResearchPlan(BaseModel):
     recommendation: PortfolioRating = Field(
         description=(
             "The investment recommendation. Exactly one of Buy / Overweight / "
-            "Hold / Underweight / Sell. Reserve Hold for situations where the "
-            "evidence on both sides is genuinely balanced; otherwise commit to "
-            "the side with the stronger arguments."
+            "Hold / Underweight / Sell. Follow the configured strategy and account constraints. "
+            "Hold is valid for unmet entry conditions, missing evidence or unacceptable risk, "
+            "as well as balanced evidence. Do not force a trade."
         ),
     )
     rationale: str = Field(
@@ -149,7 +149,16 @@ class TraderProposal(BaseModel):
         description="Optional sizing guidance, e.g. '5% of portfolio'.",
     )
 
-    @field_validator("entry_price", "stop_loss", mode="before")
+    take_profit: float | None = Field(
+        default=None,
+        description="Take-profit price consistent with the configured return target and a verified entry price; omit if the entry is unknown.",
+    )
+    exit_plan: str | None = Field(
+        default=None,
+        description="Configured take-profit rule, stop/invalidation and holding deadline. For intraday, include same-day liquidation even if the target is not reached; HOLD does not extend the deadline.",
+    )
+
+    @field_validator("entry_price", "stop_loss", "take_profit", mode="before")
     @classmethod
     def _nullish_float_to_none(cls, v):
         return _coerce_optional_float(v)
@@ -173,6 +182,10 @@ def render_trader_proposal(proposal: TraderProposal) -> str:
         parts.extend(["", f"**Stop Loss**: {proposal.stop_loss}"])
     if proposal.position_sizing:
         parts.extend(["", f"**Position Sizing**: {proposal.position_sizing}"])
+    if proposal.take_profit is not None:
+        parts.extend(["", f"**Take Profit**: {proposal.take_profit}"])
+    if proposal.exit_plan:
+        parts.extend(["", f"**Exit Plan**: {proposal.exit_plan}"])
     parts.extend([
         "",
         f"FINAL TRANSACTION PROPOSAL: **{proposal.action.value.upper()}**",
@@ -203,7 +216,8 @@ class PortfolioDecision(BaseModel):
     executive_summary: str = Field(
         description=(
             "A concise action plan covering entry strategy, position sizing, "
-            "key risk levels, and time horizon. Two to four sentences."
+            "key risk levels, configured profit target and exit deadline. Two to four sentences. "
+            "For intraday, explicitly state the same-day horizon even for Hold."
         ),
     )
     investment_thesis: str = Field(
@@ -219,7 +233,7 @@ class PortfolioDecision(BaseModel):
     )
     time_horizon: str | None = Field(
         default=None,
-        description="Optional recommended holding period, e.g. '3-6 months'.",
+        description="Holding period consistent with the configured strategy. For intraday: same-day liquidation; no extension from Hold. Do not substitute a multi-month investment horizon.",
     )
 
     @field_validator("price_target", mode="before")

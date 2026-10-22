@@ -19,6 +19,7 @@ def test_layout_preserves_existing_controls_and_unique_ids():
     ids = Counter(attrs['id'] for _, attrs in parsed.tags if 'id' in attrs)
     assert all(count == 1 for count in ids.values())
     required = {
+        'auto-run-panel', 'auto-run-once', 'auto-run-mode', 'auto-run-state', 'auto-run-message',
         'manual-panel', 'manual-ticker', 'auto-paused', 'manual-mode', 'current-job',
         'pending-job', 'last-job', 'cancel-pending', 'manual-result', 'manual-result-text',
         'control-message', 'run-dialog', 'run-stop', 'run-wait', 'run-confirm', 'run-dismiss',
@@ -37,6 +38,14 @@ def test_layout_preserves_existing_controls_and_unique_ids():
     assert {'route_' + role for role in main.AGENT_LABELS} <= fields
     periods = [attrs['value'] for _, attrs in parsed.tags if attrs.get('name') == 'return_period']
     assert periods == ['day', 'week', 'month', 'year']
+
+
+def test_auto_run_button_starts_disabled_and_uses_existing_trade_action():
+    parsed = Elements(main.render_monitor_html({}))
+    button = next(attrs for tag, attrs in parsed.tags if attrs.get('id') == 'auto-run-once')
+    assert button['type'] == 'button' and button['data-action'] == 'trade'
+    assert 'disabled' in button
+    assert '자동실행 (1회)' in main.render_monitor_html({})
 
 
 def test_tabs_details_and_new_assets_are_declared():
