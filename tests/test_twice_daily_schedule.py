@@ -27,8 +27,9 @@ def clock(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("scenario", ["auto-paper", "auto-live"])
-def test_two_slots_run_once_each_and_restart_does_not_replay(clock, monkeypatch, scenario):
-    args = main.make_parser().parse_args(["--scenario", scenario, "--yes"])
+@pytest.mark.parametrize("engine", ["rules-news", "multi-agent"])
+def test_hourly_slots_run_once_each_and_restart_does_not_replay(clock, monkeypatch, scenario, engine):
+    args = main.make_parser().parse_args(["--scenario", scenario, "--yes", "--intraday-engine", engine])
     calls = []
     async def run(args, *, execute):
         calls.append((args.date, args._schedule_slot, execute))
@@ -36,33 +37,31 @@ def test_two_slots_run_once_each_and_restart_does_not_replay(clock, monkeypatch,
         return {"ok": True, "summaryPath": args._schedule_slot + ".json"}
 
     async def advance(_):
-        if clock.current.hour == 9 and clock.current.minute == 0:
-            assert main.build_monitor_snapshot()["runtime"]["nextRunAfter"] == "2026-09-10T09:20:00+09:00"
-            clock.current = clock.current.replace(minute=20)
-        elif clock.current.hour == 9:
-            assert main.build_monitor_snapshot()["runtime"]["nextRunAfter"] == "2026-09-10T13:00:00+09:00"
-            clock.current = clock.current.replace(hour=13, minute=0)
+        if clock.current.hour < 14:
+            hour = clock.current.hour + 1
+            assert main.build_monitor_snapshot()["runtime"]["nextRunAfter"] == f"2026-09-10T{hour:02d}:00:00+09:00"
+            clock.current = clock.current.replace(hour=hour, minute=0)
         else:
-            assert main.build_monitor_snapshot()["runtime"]["nextRunAfter"] == "2026-09-11T09:00:00+09:00"
+            assert main.build_monitor_snapshot()["runtime"]["nextRunAfter"] == "2026-09-11T10:00:00+09:00"
             raise StopScheduler
 
     monkeypatch.setattr(main, "run_auto_trading", run)
     monkeypatch.setattr(main.asyncio, "sleep", advance)
     with pytest.raises(StopScheduler):
         asyncio.run(main.run_daily_market_scheduler(args))
-    assert calls == [("2026-09-10", slot, scenario == "auto-live") for slot in ("morning", "afternoon")]
+    assert calls == [("2026-09-10", f"scan-{hour}00", scenario == "auto-live") for hour in range(10, 15)]
     with pytest.raises(StopScheduler):
         asyncio.run(main.run_daily_market_scheduler(args))
-    assert len(calls) == 2
+    assert len(calls) == 5
     slots = main.load_scheduler_state(scenario)["runs"]["2026-09-10"]["slots"]
-    assert slots["morning"]["summaryPath"] == "morning.json"
-    assert slots["afternoon"]["summaryPath"] == "afternoon.json"
+    assert slots["scan-1000"]["summaryPath"] == "scan-1000.json"
+    assert slots["scan-1400"]["summaryPath"] == "scan-1400.json"
 
 
 @pytest.mark.parametrize("scenario", ["auto-paper", "auto-live"])
 def test_late_start_runs_afternoon_only(clock, monkeypatch, scenario):
     clock.current = clock.current.replace(hour=14)
-    args = main.make_parser().parse_args(["--scenario", scenario, "--yes"])
+    args = main.make_parser().parse_args(["--scenario", scenario, "--yes", "--intraday-engine", "multi-agent"])
     calls = []
     async def run(args, *, execute):
         calls.append(args._schedule_slot)
@@ -75,7 +74,7 @@ def test_late_start_runs_afternoon_only(clock, monkeypatch, scenario):
     monkeypatch.setattr(main.asyncio, "sleep", stop)
     with pytest.raises(StopScheduler):
         asyncio.run(main.run_daily_market_scheduler(args))
-    assert calls == ["afternoon"]
+    assert calls == ["scan-1400"]
 
 
 @pytest.mark.parametrize("scenario", ["auto-paper", "auto-live"])
@@ -133,10 +132,10 @@ def test_slot_boundary(clock, hour, minute, expected):
 
 
 def test_next_day_is_open_not_next_day_afternoon(clock):
-    args = main.make_parser().parse_args([])
+    args = main.make_parser().parse_args(["--intraday-engine", "multi-agent"])
     friday = datetime(2026, 9, 11, 14, 0, tzinfo=main.KOREA_TZ)
     result = main.next_trading_slot_time(friday, args, main.holiday_dates("2026-09-14"))
-    assert result.isoformat() == "2026-09-15T09:00:00+09:00"
+    assert result.isoformat() == "2026-09-15T10:00:00+09:00"
 
 
 @pytest.mark.parametrize("current,close", [
@@ -181,12 +180,12 @@ def test_afternoon_news_snapshot_does_not_overwrite_morning(clock, monkeypatch):
 
 
 def test_slow_morning_run_finishes_before_afternoon_starts(clock, monkeypatch):
-    clock.current = clock.current.replace(minute=20)
-    args = main.make_parser().parse_args([])
+    clock.current = clock.current.replace(hour=10, minute=0)
+    args = main.make_parser().parse_args(["--intraday-engine", "multi-agent"])
     calls = []
     async def run(args, *, execute):
         calls.append(args._schedule_slot)
-        if args._schedule_slot == "morning":
+        if args._schedule_slot == "scan-1000":
             clock.current = clock.current.replace(hour=13, minute=10)
             raise RuntimeError("morning analysis failed")
         return {"ok": True}
@@ -198,7 +197,7 @@ def test_slow_morning_run_finishes_before_afternoon_starts(clock, monkeypatch):
     monkeypatch.setattr(main.asyncio, "sleep", stop)
     with pytest.raises(StopScheduler):
         asyncio.run(main.run_daily_market_scheduler(args))
-    assert calls == ["morning", "afternoon"]
+    assert calls == ["scan-1000", "scan-1300"]
     slots = main.load_scheduler_state()["runs"]["2026-09-10"]["slots"]
-    assert slots["morning"]["status"] == "completed-with-errors"
-    assert slots["afternoon"]["status"] == "completed"
+    assert slots["scan-1000"]["status"] == "completed-with-errors"
+    assert slots["scan-1300"]["status"] == "completed"

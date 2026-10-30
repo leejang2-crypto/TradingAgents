@@ -8,6 +8,7 @@ import uuid
 
 from .intraday import INTRADAY_DEFAULTS
 from .toss_executor import TossOrderPlan
+from .trading_hours import TIME_DEFAULTS, scan_start
 
 
 class EntryWatch:
@@ -18,7 +19,7 @@ class EntryWatch:
         self.worker_lock = threading.Lock()
 
     def settings(self):
-        return {**INTRADAY_DEFAULTS, **self.manager.settings()}
+        return {**INTRADAY_DEFAULTS, **TIME_DEFAULTS, **self.manager.settings()}
 
     @staticmethod
     def signature(settings):
@@ -26,7 +27,9 @@ class EntryWatch:
 
     def bar_key(self):
         now = self.manager.clock()
-        return now.replace(minute=now.minute // 5 * 5, second=0, microsecond=0).isoformat()
+        settings = self.settings()
+        window = self.manager._buy_window(now, settings)
+        return scan_start(now, window[0], settings).isoformat() if window else now.date().isoformat()
 
     def cancel(self, symbol=None, reason="cancelled", expected_id=None):
         manager = self.manager
@@ -49,8 +52,8 @@ class EntryWatch:
         if self.signature(settings) != expected_settings or self.guard() == "cancel" or manager.stop_event.is_set():
             return None
         now = manager.clock()
-        window = manager._window(now, settings)
-        cutoff = window[1] - timedelta(minutes=int(settings.get("buy_cutoff_minutes", 30))) if window else now
+        window = manager._buy_window(now, settings)
+        cutoff = window[1] if window else now
         if not window or not window[0] <= now < cutoff:
             return None
         with manager.store.locked():

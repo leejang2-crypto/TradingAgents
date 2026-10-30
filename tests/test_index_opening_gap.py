@@ -154,7 +154,7 @@ def test_warning_and_basis_are_saved_and_visible_without_losing_existing_news(da
     monkeypatch.setattr(main, 'BrokerBackend', lambda *args: market)
     monkeypatch.setattr(main, 'screen_candidates', lambda *args, **kwargs:
                         screen_candidates(*args, **kwargs, clock=lambda: market.now))
-    args = main.make_parser().parse_args(['--date', data[4].date().isoformat(), '--min-session-turnover', '1000000'])
+    args = main.make_parser().parse_args(['--date', data[4].date().isoformat(), '--min-session-turnover', '1000000', '--buy-start-minutes', '20'])
     result = main.screen_candidate_snapshot(args, snapshot)
     saved = json.loads(path.read_text())
     assert saved['warnings'] == result['warnings'] and len(saved['warnings']) == 2

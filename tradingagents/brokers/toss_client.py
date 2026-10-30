@@ -11,12 +11,15 @@ from typing import Any
 
 import httpx
 
+from . import toss_transport as transport
+
 
 class TossApiError(RuntimeError):
     def __init__(self, status_code: int, message: str, payload: Any | None = None) -> None:
         super().__init__(f"Toss API error {status_code}: {message}")
         self.status_code = status_code
         self.payload = payload
+        self.rate_limit = None
 
 
 class OrderWindowClosed(RuntimeError):
@@ -63,6 +66,9 @@ class TossClient:
         await self.close()
 
     async def issue_token(self) -> TossToken:
+        key = (transport.namespace(self.base_url, self.client_id), "AUTH")
+        deadline = min(time.monotonic() + 20, transport.READ_DEADLINE.get() or float("inf"))
+        await transport.GATE.acquire(key, deadline)
         response = await self._client.post(
             "/oauth2/token",
             data={
@@ -72,6 +78,9 @@ class TossClient:
             },
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
+        rate = transport.GATE.observe(key, response)
+        if response.status_code == 429:
+            self._raise_rate_error(response, rate, 1)
         payload = self._parse_response(response, unwrap_result=False)
         token = TossToken(
             access_token=payload["access_token"],
@@ -132,16 +141,47 @@ class TossClient:
         return await self.get("/api/v1/market-calendar/KR", params={"date": day})
 
     async def get(self, path: str, params: dict[str, Any] | None = None, require_account: bool = False) -> Any:
-        headers = await self._headers(require_account=require_account)
-        response = await self._client.get(path, params=params, headers=headers)
-        if response.status_code == 401:
-            # Another process may have invalidated the shared client token.
-            # Retry reads once; never retry an order POST automatically.
-            self._tokens.pop(self._token_key(), None)
-            self._token = None
-            headers = await self._headers(require_account=require_account)
-            response = await self._client.get(path, params=params, headers=headers)
-        return self._parse_response(response)
+        key = (transport.namespace(self.base_url, self.client_id), transport.api_group("GET", path))
+        # Includes authentication, pacing, HTTP time and all retries, not just sleeps.
+        with transport.read_budget(20):
+            deadline = transport.READ_DEADLINE.get()
+            retries, reauthenticated, attempts = 0, False, 0
+            while True:
+                transport.check_read_deadline()
+                try:
+                    headers = await asyncio.wait_for(self._headers(require_account=require_account),
+                                                     max(.001, deadline - time.monotonic()))
+                except asyncio.TimeoutError as exc:
+                    raise TimeoutError("Toss 인증 대기 제한시간 초과") from exc
+                await transport.GATE.acquire(key, deadline)
+                transport.check_read_deadline()
+                attempts += 1
+                try:
+                    response = await asyncio.wait_for(self._client.get(path, params=params, headers=headers),
+                                                      max(.001, deadline - time.monotonic()))
+                except asyncio.TimeoutError as exc:
+                    raise TimeoutError("Toss 조회 응답 제한시간 초과") from exc
+                rate = transport.GATE.observe(key, response, retries)
+                transport.check_read_deadline()
+                if response.status_code == 429:
+                    if retries >= 2 or time.monotonic() + rate["retryAfterSeconds"] >= deadline:
+                        self._raise_rate_error(response, rate, attempts)
+                    retries += 1
+                    continue
+                if response.status_code == 401 and not reauthenticated:
+                    self._tokens.pop(self._token_key(), None)
+                    self._token = None
+                    reauthenticated = True
+                    continue
+                return self._parse_response(response)
+
+    @staticmethod
+    def _raise_rate_error(response, rate, attempts):
+        try:
+            TossClient._parse_response(response)
+        except TossApiError as exc:
+            exc.rate_limit = {**rate, "attempts": attempts}
+            raise
 
     async def post(
         self,
@@ -150,12 +190,17 @@ class TossClient:
         require_account: bool = False,
     ) -> Any:
         headers = await self._headers(require_account=require_account)
+        key = (transport.namespace(self.base_url, self.client_id), transport.api_group("POST", path))
+        await transport.GATE.acquire(key, time.monotonic() + 20)
         if path == "/api/v1/orders":
             from tradingagents.monitoring.control import checkpoint
             checkpoint("order-sending")
             if self.order_valid_until and datetime.now(timezone.utc) >= self.order_valid_until:
                 raise OrderWindowClosed("주문 제한 시간이 지나 전송하지 않았습니다.")
         response = await self._client.post(path, json=json, headers=headers)
+        rate = transport.GATE.observe(key, response)
+        if response.status_code == 429:
+            self._raise_rate_error(response, rate, 1)
         return self._parse_response(response)
 
     async def _headers(self, require_account: bool) -> dict[str, str]:

@@ -127,6 +127,7 @@ def start_manual(control, args, **extra):
 
 
 def test_manual_analysis_never_calls_order_executor(args, monkeypatch):
+    args.intraday_engine = "multi-agent"
     graph = Mock()
     graph.propagate.return_value = ({"final_trade_decision": "**Rating**: Buy"}, "Buy")
     graph.save_reports.return_value = "report.md"
@@ -198,8 +199,21 @@ def test_manual_trade_reserves_current_slot(args, monkeypatch):
     monkeypatch.setattr(main, "run_auto_trading", trading)
     asyncio.run(main.run_manual_job(args, control, job))
     assert control.last["status"] == "completed"
-    assert main.has_scheduler_completed(args.date, "auto-paper", main.active_trading_slot(main.datetime.now(main.KOREA_TZ)))
+    assert main.has_scheduler_completed(args.date, "auto-paper", main.active_trading_slot(main.datetime.now(main.KOREA_TZ), args))
     assert trading.call_args.kwargs["execute"] is False
+
+
+def test_manual_market_veto_is_completed_not_completed_with_errors(args, monkeypatch):
+    control = RunController()
+    job = start_manual(control, args, action="trade")
+    monkeypatch.setattr(main, "is_regular_market_open", lambda *a, **kw: True)
+    result = {"ok": True, "marketGate": {"status": "blocked"}, "selectedTickers": [],
+              "selectionReason": "시장 위험으로 신규 매수 보류: KOSPI -2.39% / 제한 -1.00%"}
+    monkeypatch.setattr(main, "run_auto_trading", AsyncMock(return_value=result))
+    asyncio.run(main.run_manual_job(args, control, job))
+    assert control.last["status"] == "completed"
+    assert control.last["result"]["marketGate"]["status"] == "blocked"
+    assert '매수 보류' in control.last["result"]["selectionReason"]
 
 
 def test_unknown_live_order_blocks_replay(args):

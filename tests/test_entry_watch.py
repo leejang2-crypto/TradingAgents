@@ -17,7 +17,8 @@ def watching(request, tmp_path, monkeypatch):
     clock = lambda: time[0]
     broker = FakeBroker(clock)
     broker.affordable_quantity = lambda price: Decimal(1000)
-    settings = {'paper_capital': '10000', 'estimated_cost_rate': '0', 'entry_watch_minutes': 30}
+    settings = {'paper_capital': '10000', 'estimated_cost_rate': '0', 'entry_watch_minutes': 30,
+                'candidate_scan_minutes': 5}
     manager = PositionRiskManager(tmp_path, live=request.param, backend=broker, settings=lambda: settings, clock=clock)
     signal = broker.entry_signal
     ready = [False]
@@ -59,6 +60,22 @@ def test_unmet_conditions_stay_waiting_without_duplicate_checks(watching):
     manager.entry_watch.process()
     row = manager.snapshot()['entryWatches']['005930']
     assert row['attempts'] == 1 and row['status'] == 'waiting' and not broker.orders
+
+
+@pytest.mark.parametrize('ttl', [30, 120])
+def test_hourly_watch_does_not_submit_between_scheduled_checks(watching, ttl):
+    manager, broker, time, settings, ready = watching
+    settings.update(candidate_scan_minutes=60, entry_watch_minutes=ttl)
+    queue(manager)
+    ready[0] = True
+    time[0] += timedelta(minutes=5)
+    manager.entry_watch.process()
+    assert not broker.orders
+    time[0] += timedelta(minutes=55)
+    manager.entry_watch.process()
+    row = manager.snapshot()['entryWatches']['005930']
+    assert row['status'] == ('submitted' if ttl == 120 else 'cancelled')
+    assert len(broker.orders) == (1 if ttl == 120 else 0)
 
 
 @pytest.mark.parametrize('reason', ['timeout', 'day-change', 'settings', 'paused', 'stop', 'restart'])

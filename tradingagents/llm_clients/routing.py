@@ -20,6 +20,7 @@ NEWS_ONLY_ROUTING = {
 }
 LLM_DEFAULTS = {
     "provider": "hybrid",
+    "openai_credit_fallback": True,
     "openai_quick_model": "gpt-5.5",
     "openai_deep_model": "gpt-5.5",
     "ollama_quick_model": "qwen3:8b",
@@ -33,6 +34,8 @@ def describe_routing(config: dict) -> dict[str, dict[str, str]]:
     provider = config["llm_provider"]
     routes = {}
     for agent in AGENT_LABELS:
+        if config.get("intraday_fast") and agent != "news_analyst":
+            continue
         kind = "deep" if agent in DEEP_AGENTS else "quick"
         selected = config.get("hybrid_agent_providers", {}).get(agent, "openai") if provider == "hybrid" else provider
         model = config[f"hybrid_{selected}_{kind}_llm"] if provider == "hybrid" else config[f"{kind}_think_llm"]

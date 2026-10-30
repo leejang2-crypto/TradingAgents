@@ -41,7 +41,7 @@ def saved_objective(content):
         lines.append(f"기본 손절 한도 -{stop}% (진입 시 더 엄격한 손절 기준 적용 가능)")
     if same_day:
         lines.append("목표 미달이어도 청산 시각에 매도 시도. 체결을 보장하지 않으며 HOLD는 보유 연장 승인이 아닙니다.")
-    for field, label in (("buy_cutoff", "신규 매수 중단"), ("liquidation_start", "청산 시작"), ("market_close", "장 종료")):
+    for field, label in (("buy_start", "신규 매수 시작"), ("buy_cutoff", "신규 매수 중단"), ("liquidation_start", "청산 시작"), ("market_close", "장 종료")):
         value = objective.get(field)
         if isinstance(value, str) and len(value) == 5:
             try:
@@ -53,8 +53,14 @@ def saved_objective(content):
         lines.append("청산 시작 시각: 이 과거 분석 파일에는 기록되지 않음")
     if same_day and approval:
         lines.append("익일 보유는 사용자 별도 승인 시에만 허용됩니다. 목표 미달만으로 자동 연장하지 않습니다.")
-        if objective.get("max_holding_sessions") == "2" or "second trading session including acquisition day" in holding:
+        minutes = str(objective.get("carry_exit_minutes", ""))
+        if minutes.isdecimal() and 0 < int(minutes) <= 60:
+            lines.append(f"승인된 이월도 다음 거래일 개장 후 {minutes}분 이내 청산 대상입니다. 실제 거래일 달력을 적용합니다.")
+        elif objective.get("max_holding_sessions") == "2" or "second trading session including acquisition day" in holding:
             lines.append("승인된 예외도 취득일 포함 최대 2거래일 이내 청산 대상입니다.")
+    interval = str(objective.get("candidate_scan_minutes", ""))
+    if interval.isdecimal() and 5 <= int(interval) <= 120:
+        lines.append(f"후보 종목 분석·점검: {interval}분 간격. 보유분 손절·익절·체결 확인은 별도 점검합니다.")
     lines.append("종목별 가격 목표이며 계좌 전체의 일일 수익률 보장이 아닙니다. 진입 조건 미충족 시 매수하지 않습니다.")
     return {"available": True, "style": objective.get("style"), "targetPercent": target,
             "stopPercent": stop, "sameDay": same_day, "lines": lines}

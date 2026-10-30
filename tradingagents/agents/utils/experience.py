@@ -90,6 +90,13 @@ class ExperienceStore:
             )
         return run_id
 
+    def change_routing(self, run_id, routing, execution):
+        with self.connect() as db:
+            if db.execute("UPDATE runs SET routing=? WHERE id=?", (encode(routing), run_id)).rowcount != 1:
+                raise ValueError("Unknown experience run ID.")
+            db.execute("INSERT INTO events(run_id,created_at,kind,payload) VALUES(?,?,?,?)",
+                       (run_id, utc_now(), "LLM_FALLBACK", encode(execution)))
+
     def save_analysis(self, run_id, state):
         reports = {}
         for role, fields in ROLE_FIELDS.items():
@@ -100,6 +107,10 @@ class ExperienceStore:
                 reports[role] = value
         payload = {"reports": reports, "validation": state.get("local_safe_validation", {}),
                    "finalRating": state.get("final_rating"), "newsExecution": state.get("news_execution")}
+        if state.get("intraday_contract"):
+            payload["intradayContract"] = state["intraday_contract"]
+        if state.get("candidate_path_reference"):
+            payload["candidatePathReference"] = state["candidate_path_reference"]
         with self.connect() as db:
             previous = db.execute("SELECT payload FROM events WHERE run_id=? AND kind='ANALYSIS' ORDER BY id DESC LIMIT 1", (run_id,)).fetchone()
             if previous and json.loads(previous["payload"]) == payload:

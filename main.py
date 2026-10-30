@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import fcntl
 import html
+import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
 import json
@@ -44,14 +45,20 @@ from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.dataflows.utils import safe_ticker_component
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.llm_clients.routing import AGENT_LABELS, DEEP_AGENTS, LLM_DEFAULTS, NEWS_ONLY_ROUTING, describe_routing
+from tradingagents.llm_clients.credit_fallback import run_with_credit_fallback
 from tradingagents.monitoring.auth import DashboardAuth, LoginError
 from tradingagents.monitoring.summary import LocalSummaryService, with_report_evidence
 from tradingagents.monitoring.control import BusyError, RunController, RunStopped, checkpoint, scheduled_job
+from tradingagents.monitoring.telegram import TelegramNotifier, DEFAULTS as TELEGRAM_DEFAULTS, CATEGORIES as TELEGRAM_CATEGORIES, notify, analysis_notification
 from tradingagents.brokers.position_risk import PositionRiskManager, RISK_DEFAULTS, BrokerBackend
+from tradingagents.brokers.trading_hours import TIME_DEFAULTS, TIME_LIMITS, buy_window, scan_start
 from tradingagents.brokers.candidate_screen import screen_candidates
 from tradingagents.brokers.intraday import INTRADAY_DEFAULTS, DECIMAL_LIMITS, INTEGER_LIMITS, ENTRY_STRATEGIES
+from tradingagents.brokers.intraday_analysis import collect_technical, news_material, review_news, build_state, IntradayReport
 from tradingagents.research.service import ResearchBusy, ResearchService
 from tradingagents.research.universe import UniverseError, validate_snapshot as validate_universe
+from tradingagents.research import postmarket
+from tradingagents.research import candidate_review
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -70,6 +77,9 @@ DEFAULT_MONITOR_PORT = 8765
 AUTO_SCENARIOS = {"auto-paper", "auto-live"}
 SETTINGS_LOCK = threading.RLock()
 SETTING_KEYS = {
+    *TELEGRAM_DEFAULTS,
+    *postmarket.DEFAULTS,
+    "intraday_engine",
     "paper_capital",
     "position_pct",
     "daily_target_return",
@@ -98,6 +108,10 @@ def make_parser() -> argparse.ArgumentParser:
             "stock candidates and runs paper trading only."
         )
     )
+    parser.add_argument("--intraday-engine", choices=["rules-news", "multi-agent"], default="rules-news",
+                        help="Hourly candidate analysis: 5-minute chart rules + news review, or multi-agent analysis.")
+    for key, value in {**postmarket.DEFAULTS, **TELEGRAM_DEFAULTS}.items():
+        parser.add_argument("--" + key.replace("_", "-"), action=argparse.BooleanOptionalAction, default=value)
     parser.add_argument(
         "--scenario",
         choices=["auto-paper", "auto-live", "all-safe", "tests", "minimal", "korea-dry-run", "korea-execute"],
@@ -129,7 +143,9 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quick-model", help="Override quick analyst/debate model.")
     parser.add_argument("--deep-model", help="Override deeper manager/portfolio model.")
     for key, value in LLM_DEFAULTS.items():
-        if key not in {"provider", "hybrid_agent_providers"}:
+        if isinstance(value, bool):
+            parser.add_argument("--" + key.replace("_", "-"), action=argparse.BooleanOptionalAction, default=value)
+        elif key not in {"provider", "hybrid_agent_providers"}:
             parser.add_argument("--" + key.replace("_", "-"), default=value)
     parser.add_argument(
         "--backend-url",
@@ -177,7 +193,7 @@ def make_parser() -> argparse.ArgumentParser:
         default="daily-market",
         help=(
             "Automatic trading run mode. daily-market keeps main.py alive and runs "
-            "at market open and 13:00 Korea time; once runs immediately and exits."
+            "hourly from one hour after open until one hour before close; once analyzes immediately but respects order windows."
         ),
     )
     parser.add_argument(
@@ -403,7 +419,7 @@ def load_scheduler_state(scenario: str = "auto-paper") -> dict[str, Any]:
                         pass
                 record["slots"] = {slot: dict(record) for slot in slots}
             if not isinstance(record["slots"], dict) or any(
-                slot not in TRADING_SLOTS or not isinstance(value, dict) or not isinstance(value.get("status"), str)
+                not valid_trading_slot(slot) or not isinstance(value, dict) or not isinstance(value.get("status"), str)
                 for slot, value in record["slots"].items()
             ):
                 raise ValueError("Invalid scheduler slots")
@@ -414,7 +430,7 @@ def load_scheduler_state(scenario: str = "auto-paper") -> dict[str, Any]:
 
 
 def mark_scheduler_completed(run_date: str, summary_path: str | None, status: str = "completed", *, scenario: str = "auto-paper", slot: str = "morning") -> None:
-    if slot not in TRADING_SLOTS:
+    if not valid_trading_slot(slot):
         raise ValueError("Invalid trading slot")
     path = scheduler_state_path(scenario)
     state = load_scheduler_state(scenario)
@@ -442,7 +458,7 @@ def has_scheduler_completed(run_date: str, scenario: str = "auto-paper", slot: s
 
 
 def mark_run_started(run_date: str, scenario: str, slot: str) -> None:
-    if slot not in TRADING_SLOTS:
+    if not valid_trading_slot(slot):
         raise ValueError("Invalid trading slot")
     state = load_scheduler_state(scenario)
     record = state.setdefault("runs", {}).setdefault(run_date, {"slots": {}})
@@ -462,20 +478,47 @@ def mark_live_run_started(run_date: str, slot: str = "morning") -> None:
     mark_run_started(run_date, "auto-live", slot)
 
 
-def active_trading_slot(now: datetime) -> str:
+def uses_intraday_rules(args) -> bool:
+    return getattr(args, "intraday_engine", "multi-agent") == "rules-news"
+
+
+def valid_trading_slot(slot) -> bool:
+    return isinstance(slot, str) and (slot in TRADING_SLOTS or bool(re.fullmatch(r"scan-(?:[01][0-9]|2[0-3])[0-5][0-9]", slot)))
+
+
+def scheduled_entry_window(now: datetime, args):
+    risk = getattr(args, "_position_manager", None)
+    if isinstance(risk, PositionRiskManager):
+        return risk._buy_window(now, default_settings(args))
+    window = market_window_for(now.astimezone(KOREA_TZ).date(), args.market_open, args.market_close)
+    return buy_window(window, default_settings(args))
+
+
+def active_trading_slot(now: datetime, args=None, entry_window=None) -> str:
+    if args is not None:
+        local = now.astimezone(KOREA_TZ)
+        window = entry_window or scheduled_entry_window(local, args)
+        first = window[0] if window else local.replace(hour=0, minute=0, second=0, microsecond=0)
+        return scan_start(local, first, vars(args)).strftime("scan-%H%M")
     return "afternoon" if now.astimezone(KOREA_TZ).time() >= parse_hhmm(AFTERNOON_RUN_TIME) else "morning"
 
 
-def next_trading_slot_time(now: datetime, args: argparse.Namespace, holidays: set[date]) -> datetime:
-    afternoon = datetime.combine(now.date(), parse_hhmm(AFTERNOON_RUN_TIME), tzinfo=KOREA_TZ)
-    if now < afternoon and parse_hhmm(AFTERNOON_RUN_TIME) < parse_hhmm(args.market_close):
-        return afternoon
+def next_trading_slot_time(now: datetime, args: argparse.Namespace, holidays: set[date], entry_window=None) -> datetime:
+    now = now.astimezone(KOREA_TZ)
+    window = entry_window or scheduled_entry_window(now, args)
+    if window:
+        following = window[0] if now < window[0] else scan_start(now, window[0], vars(args)) + timedelta(minutes=args.candidate_scan_minutes)
+        if following < window[1]:
+            return following
     tomorrow = datetime.combine(now.date() + timedelta(days=1), time.min, tzinfo=KOREA_TZ)
-    return next_regular_market_open(tomorrow, open_text=args.market_open, close_text=args.market_close, holidays=holidays)
+    return next_regular_market_open(tomorrow, open_text=args.market_open, close_text=args.market_close, holidays=holidays) + timedelta(minutes=args.buy_start_minutes)
 
 
 def default_settings(args: argparse.Namespace) -> dict[str, Any]:
     return {
+        **{key: getattr(args, key, value) for key, value in TELEGRAM_DEFAULTS.items()},
+        "intraday_engine": getattr(args, "intraday_engine", "rules-news"),
+        **{key: getattr(args, key, value) for key, value in postmarket.DEFAULTS.items()},
         **{key: getattr(args, key, value) for key, value in RISK_DEFAULTS.items()},
         **{key: getattr(args, key, value) for key, value in INTRADAY_DEFAULTS.items()},
         **{key: deepcopy(getattr(args, key, value)) for key, value in LLM_DEFAULTS.items()},
@@ -578,12 +621,20 @@ def validate_trading_settings(settings: dict[str, Any]) -> dict[str, Any]:
         elif key in RISK_DEFAULTS or key in INTEGER_LIMITS:
             if isinstance(value, bool) or not re.fullmatch(r"[0-9]+", str(value)):
                 raise ValueError(f"{key} must be a whole number.")
-            limits = INTEGER_LIMITS.get(key, (10, 300) if key == "position_check_seconds" else (5, 120))
+            limits = INTEGER_LIMITS.get(key, TIME_LIMITS.get(key, (10, 300)))
             if not limits[0] <= int(value) <= limits[1]:
                 raise ValueError(f"{key} must be between {limits[0]} and {limits[1]}.")
             if key == "opening_range_minutes" and int(value) % 5:
                 raise ValueError("opening_range_minutes must use 5-minute steps.")
             cleaned[key] = int(value)
+        elif key == "openai_credit_fallback" or key in postmarket.DEFAULTS or key in TELEGRAM_DEFAULTS:
+            if not isinstance(value, bool):
+                raise ValueError(f"{key} must be a boolean.")
+            cleaned[key] = value
+        elif key == "intraday_engine":
+            if not isinstance(value, str) or value not in {"rules-news", "multi-agent"}:
+                raise ValueError("Unknown intraday engine.")
+            cleaned[key] = value
         elif key == "provider":
             if not isinstance(value, str) or value not in {"openai", "ollama", "hybrid"}:
                 raise ValueError("provider must be openai, ollama, or hybrid.")
@@ -609,8 +660,13 @@ def validate_trading_settings(settings: dict[str, Any]) -> dict[str, Any]:
         open_text = str(cleaned.get("market_open", DEFAULT_MARKET_OPEN))
         close_text = str(cleaned.get("market_close", DEFAULT_MARKET_CLOSE))
         market_window_for(today_korea(), open_text, close_text)
-    if cleaned.get("buy_cutoff_minutes", 30) < cleaned.get("liquidation_minutes", 15):
+    if cleaned.get("buy_cutoff_minutes", TIME_DEFAULTS["buy_cutoff_minutes"]) < cleaned.get("liquidation_minutes", 15):
         raise ValueError("신규 매수 중단은 청산 시작보다 늦을 수 없습니다.")
+    if any(key in cleaned for key in ("market_open", "market_close", "buy_start_minutes", "buy_cutoff_minutes")):
+        window = market_window_for(today_korea(), cleaned.get("market_open", DEFAULT_MARKET_OPEN), cleaned.get("market_close", DEFAULT_MARKET_CLOSE))
+        start, end = buy_window(window, cleaned)
+        if start >= end:
+            raise ValueError("매수 시작은 신규 매수 중단보다 빨라야 합니다.")
     return cleaned
 
 
@@ -780,6 +836,7 @@ def build_monitor_snapshot() -> dict[str, Any]:
         "authentication": "login-session",
         "latestSummaryPath": str(latest_summary_path) if latest_summary_path else None,
         "latestSummary": latest_summary,
+        "postmarketReview": read_json_file(LOCAL_DIR / "postmarket" / f"latest-{'live' if live else 'dry-run'}.json"),
         "latestCandidatePath": str(latest_candidate_path) if latest_candidate_path else None,
         "latestCandidates": latest_candidates,
         "recentTrades": paper_history(LOCAL_DIR, trades),
@@ -802,8 +859,38 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
         f"코스피200 · {len(candidate_universe.get('members', {}))}종목 · 기준일 {candidate_universe.get('asOf')} · {candidate_universe.get('source')}"
         if candidate_universe.get("index") == "KOSPI200" else "구성목록 정보 없음 (이전 결과 또는 등록 필요)"
     )
+    candidate_market = candidates.get("intradayScreen") or {}
+    candidate_market_status = {"completed": "평가 완료", "partial": "일부 미평가", "failed": "자료/처리 오류",
+                               "market-blocked": "시장 위험으로 신규 매수 보류"}.get(
+                                   candidate_market.get("status"), candidate_market.get("status", "미평가"))
     settings = snapshot.get("settings") if isinstance(snapshot.get("settings"), dict) else {}
-    settings = {**LLM_DEFAULTS, **INTRADAY_DEFAULTS, **settings}
+    settings = {**LLM_DEFAULTS, **INTRADAY_DEFAULTS, **postmarket.DEFAULTS, **TELEGRAM_DEFAULTS, **settings}
+    telegram_controls = ''.join(
+        f'<label style="display:flex;align-items:center;gap:8px"><input style="width:auto" type="checkbox" name="telegram_{key}" '
+        f'{"checked" if settings["telegram_" + key] else ""}>{label}</label>' for key, label in TELEGRAM_CATEGORIES.items())
+    review = snapshot.get("postmarketReview")
+    review = review if isinstance(review, dict) else {}
+    review_policy = review.get("policy")
+    review_policy = review_policy if isinstance(review_policy, dict) else {}
+    candidate_recap = review.get("candidateReview")
+    candidate_recap = candidate_recap if isinstance(candidate_recap, dict) else {}
+    recap_rows = []
+    for row in candidate_recap.get("candidates", []):
+        windows = row.get("windows", [])
+        examples = "; ".join(
+            f"{ENTRY_STRATEGIES.get(window.get('strategy'), window.get('strategy'))} "
+            f"{str(window.get('entryAt', ''))[11:16]} → {str(window.get('exitAt') or '-')[11:16]} "
+            f"{candidate_review.OUTCOMES.get(window.get('outcome'), window.get('outcome'))}"
+            for window in windows[:3])
+        price_range = (row.get("priceRange") or {}).get("best")
+        try:
+            price_text = f"사후 상승폭 상한 {Decimal(price_range['grossRise']) * 100:.2f}% (손절 무시)"
+        except (TypeError, ValueError, KeyError, ArithmeticError):
+            price_text = "가격 구간 미확인"
+        recap_rows.append(f'<tr><td>{_compact_text(row.get("name"))}<br>{_compact_text(row.get("symbol"))}</td>'
+                          f'<td>{_compact_text(row.get("status"))}<br>{_compact_text(row.get("reason"), "")}</td>'
+                          f'<td>{_compact_text(row.get("targetWindows", 0))} / {_compact_text(row.get("ambiguousWindows", 0))}<br>{_compact_text(price_text)}</td>'
+                          f'<td>{_compact_text(examples, "확인된 구간 없음")}</td></tr>')
 
     def options(values: dict[str, str], selected: str) -> str:
         return "".join(f'<option value="{_compact_text(value)}"{" selected" if value == selected else ""}>{_compact_text(label)}</option>' for value, label in values.items())
@@ -843,6 +930,8 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
         intraday = row.get("intraday") or {}
         metrics = intraday.get("metrics") or {}
         screen_text = ("통과" if intraday.get("eligible") else "; ".join(intraday.get("reasons", []))) if intraday else "미평가"
+        if intraday.get("watchable"):
+            screen_text = "WATCH · " + screen_text
         metric_text = (
             f"거래량 {metrics['relativeVolume']:.2f}배 · 거래대금 {metrics['turnoverEstimate'] / 1e8:.1f}억 · "
             f"시장 대비 {metrics['relativeStrength'] * 100:+.2f}%p · ATR {metrics['atrFraction'] * 100:.2f}%"
@@ -909,6 +998,10 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
         if simulation:
             order_label += " · " + simulation["status"] + (" · " + simulation["reason"] if simulation.get("reason") else "")
         decision_text = str(analysis.get("error") or analysis.get("decision") or "-")
+        fallback = (analysis.get("llmExecution") or {}).get("fallback")
+        fallback_text = ""
+        if fallback:
+            fallback_text = "<p>OpenAI 크레딧 소진으로 로컬 전환 · " + _compact_text(fallback.get("mode")) + "</p>"
         detail_key = _compact_text(str(analysis.get("ticker")) + ":" + str(analysis.get("reportPath")))
         analysis_rows.append(
             "<tr>"
@@ -919,6 +1012,7 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
             f"<td>{_compact_text(order_label)}</td>"
             f'<td><details data-detail-key="report:{detail_key}"><summary>보고서 경로</summary><code>{_compact_text(analysis.get("reportPath"))}</code></details></td>'
             f'<td><details data-detail-key="llm:{detail_key}"><summary>{_compact_text(analysis.get("provider"), "사용 LLM")}</summary>'
+            f"{fallback_text}"
             f"{'<br>'.join(_compact_text(AGENT_LABELS.get(name, name) + ': ' + route['provider'] + ' / ' + route['model']) for name, route in (analysis.get('agentRouting') or {}).items() if name not in {'sentiment_analyst', 'fundamentals_analyst'}) or _compact_text(analysis.get('provider'))}</details></td>"
             "</tr>"
         )
@@ -936,6 +1030,7 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
   <script src="/assets/account.js" defer></script>
   <script src="/assets/control.js" defer></script>
   <script src="/assets/positions.js" defer></script>
+  <script src="/assets/telegram.js" defer></script>
   <style>
     :root {{ color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
     body {{ margin: 0; background: #f7f8fa; color: #1d2433; }}
@@ -973,6 +1068,10 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
       const message = document.getElementById("settings-message");
       const submittedSignature = window.Dashboard?.formSignature();
       const payload = Object.fromEntries(new FormData(form).entries());
+      payload.openai_credit_fallback = form.elements.openai_credit_fallback.checked;
+      payload.postmarket_review = form.elements.postmarket_review.checked;
+      payload.postmarket_apply = form.elements.postmarket_apply.checked;
+      for (const key of {json.dumps(list(TELEGRAM_DEFAULTS))}) payload[key] = form.elements[key].checked;
       payload.hybrid_agent_providers = {{}};
       for (const key of Object.keys(payload)) {{
         if (key.startsWith("route_")) {{
@@ -1161,7 +1260,7 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
       <h2>보유 관리 · 청산</h2>
       <p id="positions-status" role="status">보유 관리 연결 확인 중</p>
       <div id="positions-daily"></div>
-      <p class="muted">매수일 포함 최대 2거래일. 자동 분석을 일시정지해도 보유 점검·청산은 계속됩니다.</p>
+      <p class="muted">당일 청산 원칙 · 승인된 이월도 다음 거래일 개장 후 최대 1시간 이내 청산. 자동 분석을 일시정지해도 보유 점검·청산은 계속됩니다.</p>
       <div class="account-scroll"><table><thead><tr><th>종목</th><th>관리 수량</th><th>평균 매입가</th><th>종목 수익률</th><th>익절가 / 손절가</th><th>매수일</th><th>최종 보유 한도</th><th>다음 거래일까지 이월 허용</th><th>청산 상태</th></tr></thead><tbody id="positions-body"></tbody></table></div>
       <details data-detail-key="entry-checks"><summary>종목별 진입 검사</summary><div id="entry-checks"></div></details>
       <details data-detail-key="entry-watches" open><summary>매수 조건 대기 후보</summary><div id="entry-watches"></div></details>
@@ -1234,12 +1333,21 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
           {model_controls}
           <label>Ollama 주소<input name="ollama_base_url" type="url" required value="{_compact_text(settings['ollama_base_url'])}"></label>
         </div>
+        <label style="display:flex;align-items:center;gap:8px"><input style="width:auto" type="checkbox" name="openai_credit_fallback" {'checked' if settings['openai_credit_fallback'] else ''}>OpenAI 크레딧 소진 시 Ollama로 전환</label>
         <datalist id="ollama-models"></datalist>
         <datalist id="openai-models"><option value="gpt-5.5"><option value="gpt-5.4-mini"></datalist>
         <button type="button" onclick="loadLocalModels()">로컬 모델 목록 확인</button>
         <div id="ollama-status" class="message" role="status"></div>
         <button type="button" onclick="newsLocalPreset()">뉴스만 로컬로 설정</button>
         <div id="agent-routing" class="form-grid">{role_controls}</div>
+        </details>
+        <details class="settings-group" data-detail-key="settings-telegram"><summary>텔레그램 알림</summary>
+          <label style="display:flex;align-items:center;gap:8px"><input style="width:auto" type="checkbox" name="telegram_enabled" {'checked' if settings['telegram_enabled'] else ''}>알림 활성화</label>
+          <div class="form-grid">{telegram_controls}</div>
+          <p id="telegram-status" class="message" role="status">연결 상태 확인 중</p>
+          <button id="telegram-test" type="button" disabled>테스트 알림 전송</button>
+          <p class="muted">연결 설정: <code>{_compact_text(str(PROJECT_DIR / 'Setup-Telegram.command'))}</code></p>
+          <details data-detail-key="telegram-recent"><summary>최근 전송 내역</summary><div id="telegram-recent"></div></details>
         </details>
         <details class="settings-group" data-detail-key="settings-capital"><summary>자본과 목표</summary>
         <div class="form-grid">
@@ -1263,6 +1371,9 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
         </label>
         </details>
         <details class="settings-group" data-detail-key="settings-intraday" open><summary>단타 매매 기준</summary>
+        <label>자동 단타 분석<select name="intraday_engine">{options({"rules-news": "5분봉 규칙 + 뉴스 검토", "multi-agent": "다중 에이전트 분석"}, settings.get("intraday_engine", "rules-news"))}</select></label>
+        <label><input type="checkbox" style="width:auto" name="postmarket_review" {'checked' if settings['postmarket_review'] else ''}>장 마감 자동 복기</label>
+        <label><input type="checkbox" style="width:auto" name="postmarket_apply" {'checked' if settings['postmarket_apply'] else ''}>검증된 복기 결과로 신규 진입 규모 조정</label>
         <div class="form-grid">
           <label>분봉 진입 전략<select name="entry_strategy">{options(ENTRY_STRATEGIES, settings['entry_strategy'])}</select></label>
           {intraday_controls}
@@ -1272,7 +1383,10 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
         <div class="form-grid">
           <label>보유 점검 주기 (초)<input name="position_check_seconds" type="number" min="10" max="300" value="{settings.get('position_check_seconds', 30)}"></label>
           <label>장 종료 전 청산 시작 (분)<input name="liquidation_minutes" type="number" min="5" max="120" value="{settings.get('liquidation_minutes', 15)}"></label>
-          <label>장 종료 전 신규 매수 중단 (분)<input name="buy_cutoff_minutes" type="number" min="5" max="120" value="{settings.get('buy_cutoff_minutes', 30)}"></label>
+          <label>개장 후 신규 매수 시작 (분)<input name="buy_start_minutes" type="number" min="20" max="120" value="{settings.get('buy_start_minutes', 60)}"></label>
+          <label>장 종료 전 신규 매수 중단 (분)<input name="buy_cutoff_minutes" type="number" min="5" max="120" value="{settings.get('buy_cutoff_minutes', 60)}"></label>
+          <label>후보 종목 분석·점검 주기 (분)<input name="candidate_scan_minutes" type="number" min="5" max="120" value="{settings.get('candidate_scan_minutes', 60)}"></label>
+          <label>이월 종목 익일 개장 후 청산 기한 (분)<input name="carry_exit_minutes" type="number" min="5" max="60" value="{settings.get('carry_exit_minutes', 60)}"></label>
         </div>
         <div class="form-grid">
           <label>장 시작<input name="market_open" value="{_compact_text(settings.get("market_open", DEFAULT_MARKET_OPEN))}"></label>
@@ -1290,6 +1404,18 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
     </section>
     <section data-live="analyses">
       <h2>Latest Analyses</h2>
+      <details data-detail-key="postmarket-review"><summary>장 마감 복기 · {_compact_text(review.get('date'), '기록 없음')} · {_compact_text(review.get('status'), '-')}</summary>
+        <p>완결 매매 {_compact_text(review.get('roundTrips'))}회 · 확인 순손익 {_compact_text(review.get('netRealizedPnl'), '미확인')}원</p>
+        <p>다음 날 규모 축소 규칙: {len(review_policy.get('adjustments') or {})}개 · 적용 시작 {_compact_text(review_policy.get('effectiveFrom'))}</p>
+        <p role="status">{_compact_text(review.get('error'), '')}</p>
+        <p><code>{_compact_text(review.get('reportPath'), str(postmarket.ARCHIVE_ROOT))}</code></p>
+        <h3>후보 가격흐름 · 가상 관찰</h3>
+        <p>후보 {_compact_text(candidate_recap.get('candidateCount', 0))}개 · 종가 자료 확인 {_compact_text(candidate_recap.get('completeCount', 0))}개 · 목표 선도달 구간 관찰 {_compact_text(candidate_recap.get('targetCandidateCount', 0))}개</p>
+        <p>신호·손절을 무시한 가격상 목표 구간: {_compact_text(candidate_recap.get('priceTargetCandidateCount', 0))}종목 · 후보 분봉 조회 시도 {_compact_text(review.get('candidateFetchAttempts', 0))}/3회</p>
+        <p class="muted">비용·손절을 구분한 차트 가정입니다. 실제 체결이나 수익 보장이 아니며, 호가·뉴스·계좌 조건은 별도 확인이 필요합니다.</p>
+        <div class="account-scroll"><table><thead><tr><th>후보</th><th>자료 상태</th><th>목표 / 순서 불명 구간</th><th>패턴 · 가정 진입 → 종료 (일부)</th></tr></thead>
+        <tbody>{''.join(recap_rows) or '<tr><td colspan="4">가격흐름 복기 기록 없음</td></tr>'}</tbody></table></div>
+      </details>
       <table><thead><tr><th>Ticker</th><th>종목명</th><th>Rank</th><th>Decision / Error</th><th>Order</th><th>Report</th><th>사용 LLM</th></tr></thead>
       <tbody>{''.join(analysis_rows) or '<tr><td colspan="7">No analysis yet</td></tr>'}</tbody></table>
       <details data-detail-key="analysis-path"><summary>분석 요약 파일 경로</summary><p>{summary_link}</p></details>
@@ -1303,7 +1429,7 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
     <section data-live="candidates">
       <h2>Candidate Ranking</h2>
       <p>{_compact_text(candidate_scope)}</p>
-      <p class="muted">시장평가: {_compact_text((candidates.get('intradayScreen') or {}).get('status'), '미평가')} · 기준 시각: {_compact_text((candidates.get('intradayScreen') or {}).get('asOf'))}</p>
+      <p class="muted">시장평가: {_compact_text(candidate_market_status, '미평가')} · 확인 시각: {_compact_text(candidate_market.get('asOf'))}</p>
       <p role="status">{_compact_text(candidates.get('selectionReason') or candidates.get('error'), '')}</p>
       {''.join('<p class="muted">' + _compact_text(warning) + '</p>' for warning in (candidates.get('warnings') or []))}
       <div class="candidate-scroll"><table><thead><tr><th>Ticker</th><th>Name</th><th>뉴스 점수</th><th>Mentions</th><th>Positive</th><th>Risk</th><th>단타 점수</th><th>시장자료 평가</th></tr></thead>
@@ -1366,7 +1492,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
     def _get(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path in {"/assets/account.js", "/assets/account.css", "/assets/control.js", "/assets/control.css", "/assets/login.js", "/assets/positions.js", "/assets/dashboard.js", "/assets/dashboard.css", "/assets/research.js"}:
+        if parsed.path in {"/assets/account.js", "/assets/account.css", "/assets/control.js", "/assets/control.css", "/assets/login.js", "/assets/positions.js", "/assets/dashboard.js", "/assets/dashboard.css", "/assets/research.js", "/assets/telegram.js"}:
             name = parsed.path.rsplit("/", 1)[-1]
             payload = (PROJECT_DIR / "tradingagents" / "monitoring" / name).read_bytes()
             self.send_response(200)
@@ -1394,6 +1520,10 @@ class MonitorHandler(BaseHTTPRequestHandler):
                 self.end_headers()
             else:
                 self._send_json(401, {"ok": False, "error": "로그인이 필요합니다."})
+            return
+        if parsed.path == "/api/telegram":
+            service = getattr(self.server, "telegram", None)
+            self._send_json(200, service.status() if isinstance(service, TelegramNotifier) else {"available": False})
             return
         if parsed.path == "/api/research":
             research = getattr(self.server, "research", None)
@@ -1457,7 +1587,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
     def _post(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path not in {"/api/positions/watch-cancel", "/api/analysis-summary/local", "/api/settings", "/api/account/refresh", "/api/login", "/api/logout", "/api/control/run", "/api/control/pause", "/api/control/cancel-pending", "/api/positions/carry", "/api/positions/adopt", "/api/research/run", "/api/research/stop", "/api/research/universe"}:
+        if parsed.path not in {"/api/telegram/test", "/api/positions/watch-cancel", "/api/analysis-summary/local", "/api/settings", "/api/account/refresh", "/api/login", "/api/logout", "/api/control/run", "/api/control/pause", "/api/control/cancel-pending", "/api/positions/carry", "/api/positions/adopt", "/api/research/run", "/api/research/stop", "/api/research/universe"}:
             self.send_error(404)
             return
         if parsed.path != "/api/login" and not self._authorized():
@@ -1485,6 +1615,11 @@ class MonitorHandler(BaseHTTPRequestHandler):
                 payload = {key: values[-1] for key, values in parsed_form.items()}
             if not isinstance(payload, dict):
                 raise ValueError("Settings payload must be an object.")
+            if parsed.path == "/api/telegram/test":
+                service = getattr(self.server, "telegram", None)
+                queued = isinstance(service, TelegramNotifier) and service.test()
+                self._send_json(202 if queued else 409, {"ok": queued, "error": None if queued else "연결 설정·알림 활성화를 확인하세요. 테스트는 30초 간격입니다."})
+                return
             if parsed.path == "/api/analysis-summary/local":
                 self._local_summary(parsed.query, start=True)
                 return
@@ -1600,7 +1735,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
         return
 
 
-def start_monitor_server(host: str, port: int, *, scenario: str = "auto-paper", control=None, risk=None) -> ThreadingHTTPServer:
+def start_monitor_server(host: str, port: int, *, scenario: str = "auto-paper", control=None, risk=None, telegram=None) -> ThreadingHTTPServer:
     bind_host, access_host = resolve_monitor_host(host)
     server = ThreadingHTTPServer((bind_host, port), MonitorHandler)
     server.local_summary = LocalSummaryService()
@@ -1608,6 +1743,7 @@ def start_monitor_server(host: str, port: int, *, scenario: str = "auto-paper", 
                                secure_cookie=os.getenv("TRADINGAGENTS_WEB_SECURE_COOKIE", "").lower() in {"1", "true"})
     server.control = control
     server.risk = risk
+    server.telegram = telegram
     server.research = ResearchService(LOCAL_DIR / "long_term", PROJECT_DIR)
     ensure_monitor_token()
     port = server.server_address[1]
@@ -1710,6 +1846,7 @@ def daily_profit_target(args: argparse.Namespace) -> Decimal:
 def trading_objective(args: argparse.Namespace) -> dict[str, str]:
     market_close = getattr(args, "market_close", DEFAULT_MARKET_CLOSE)
     close = datetime.strptime(market_close, "%H:%M")
+    opening = datetime.strptime(getattr(args, "market_open", DEFAULT_MARKET_OPEN), "%H:%M")
     return {
         "style": args.trading_style,
         "capital_krw": str(Decimal(args.paper_capital).quantize(Decimal("1"))),
@@ -1720,10 +1857,14 @@ def trading_objective(args: argparse.Namespace) -> dict[str, str]:
         "per_trade_budget_krw": str(order_budget(args)),
         "market_close": market_close,
         "liquidation_start": (close - timedelta(minutes=int(getattr(args, "liquidation_minutes", 15)))).strftime("%H:%M"),
-        "buy_cutoff": (close - timedelta(minutes=int(getattr(args, "buy_cutoff_minutes", 30)))).strftime("%H:%M"),
+        "buy_start": (opening + timedelta(minutes=int(getattr(args, "buy_start_minutes", 60)))).strftime("%H:%M"),
+        "buy_cutoff": (close - timedelta(minutes=int(getattr(args, "buy_cutoff_minutes", 60)))).strftime("%H:%M"),
+        "candidate_scan_minutes": str(getattr(args, "candidate_scan_minutes", 60)),
+        "carry_exit_minutes": str(getattr(args, "carry_exit_minutes", 60)),
+        "carry_exit_time": (opening + timedelta(minutes=int(getattr(args, "carry_exit_minutes", 60)))).strftime("%H:%M"),
         "overnight_policy": "explicit-approval-only",
         "max_holding_sessions": "2",
-        "holding_period": "Same-day liquidation by default. Only explicit user approval permits one overnight hold; liquidate by the second trading session including acquisition day. HOLD never authorizes an extension.",
+        "holding_period": "Same-day liquidation by default. Only explicit user approval permits one overnight hold; exit within the configured carry_exit_minutes (at most 60 minutes) after the next trading session opens. HOLD never authorizes an extension. Actual exchange session times override nominal clock times.",
         "risk_note": (
             "This is a trading objective, not a guarantee. Agents should "
             "prefer liquid Korean stocks with clear intraday catalysts, define "
@@ -1798,6 +1939,35 @@ def make_config(
     return config
 
 
+def discovery_for_scan(args):
+    """Refresh news shortlist every 15m; re-evaluate market data every 5m.
+
+    Never reuse a failed collection or a screen result. CSV/settings changes
+    invalidate immediately. This cache lives only in the running scheduler.
+    """
+    if not uses_intraday_rules(args):
+        return collect_candidate_snapshot(args)
+    path = LOCAL_DIR / "long_term" / "universe.json"
+    revision = hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+    key = (str(LOCAL_DIR), args.date, revision, args.candidate_days, args.candidate_categories,
+           args.extra_queries, args.news_display, args.candidate_limit)
+    now = datetime.now(KOREA_TZ)
+    cached = getattr(args, "_discovery_cache", None)
+    if cached and cached[0] == key and 0 <= (now - cached[1]).total_seconds() < 900:
+        snapshot = deepcopy(cached[2])
+        prefix = auto_scenario(args).replace("-", "_")
+        path = LOCAL_DIR / "candidates" / f"{prefix}_candidates_{args.date}_{now:%H%M%S_%f}_cached.json"
+        snapshot.update(jsonPath=str(path), markdownPath=None,
+                        newsCache={"hit": True, "collectedAt": cached[1].isoformat(), "ttlSeconds": 900,
+                                   "sourcePath": cached[2].get("jsonPath")})
+        atomic_write_json(path, snapshot)
+        return snapshot
+    snapshot = collect_candidate_snapshot(args)
+    if snapshot.get("ok"):
+        args._discovery_cache = (key, now, deepcopy(snapshot))
+    return snapshot
+
+
 def collect_korea_news_snapshot(args: argparse.Namespace) -> dict[str, Any] | None:
     if args.skip_news_collection:
         return None
@@ -1816,6 +1986,8 @@ def collect_korea_news_snapshot(args: argparse.Namespace) -> dict[str, Any] | No
             display=args.news_display,
             sort="date",
         )
+    except RunStopped:
+        raise
     except Exception as exc:
         return {
             "ok": False,
@@ -2010,14 +2182,30 @@ async def run_korea_toss(args: argparse.Namespace, *, execute: bool) -> dict[str
     if isinstance(risk, PositionRiskManager):
         await asyncio.to_thread(risk.entry_watch.cancel, args.korea_ticker.split(".")[0], "새 분석 시작")
 
-    quick_model, deep_model, backend_url = resolve_models(args)
-    collected_news = collect_korea_news_snapshot(args)
+    fast = getattr(args, "_intraday_fast", False)
+    technical = None
+    if fast:
+        backend = risk.backend if isinstance(risk, PositionRiskManager) else BrokerBackend(LOCAL_DIR, False, args.paper_capital)
+        settings = {**{key: getattr(args, key, value) for key, value in INTRADAY_DEFAULTS.items()},
+                    **{key: getattr(args, key, value) for key, value in TIME_DEFAULTS.items()},
+                    "market_open": args.market_open, "market_close": args.market_close,
+                    "holiday_dates": args.holiday_dates, "buy_cutoff_minutes": args.buy_cutoff_minutes,
+                    "liquidation_minutes": args.liquidation_minutes,
+                    "per_trade_budget": str(order_budget(args))}
+        technical = await asyncio.to_thread(collect_technical, backend, args.korea_ticker, args.date, settings)
+    collected_news = (await asyncio.to_thread(collect_korea_news_snapshot, args)
+                      if not fast or technical["signal"]["allowed"] else None)
     checkpoint("analysis")
     collected_news_path = collected_news["path"] if collected_news and collected_news.get("ok") else None
     config = make_config(
         args, korea_mode=True, minimal_mode=False, collected_news_path=collected_news_path,
     )
+    config["intraday_fast"] = fast
     mode = "live" if execute else "dry-run"
+    if fast:
+        config["candidate_path_reference"] = candidate_review.prior_reference(
+            LOCAL_DIR, mode, risk.store.path.stem if isinstance(risk, PositionRiskManager) else "paper",
+            args.korea_ticker, datetime.now(KOREA_TZ), technical["settings"])
     if not execute and args.date == today_korea().isoformat():
         config["account_context"] = paper_account(LOCAL_DIR, args.paper_capital).trading_context(args.korea_ticker.split(".")[0])
     store = ExperienceStore(LOCAL_DIR / "learning" / "experiences.sqlite3")
@@ -2030,18 +2218,55 @@ async def run_korea_toss(args: argparse.Namespace, *, execute: bool) -> dict[str
     # No weights are trained; at most three earlier experiences per role are
     # added to its existing prompt, with no additional LLM reflection calls.
     config.update({
-        "experience_enabled": True,
+        "experience_enabled": not fast,
         "experience_db_path": str(store.path),
         "experience_run_id": run_id,
         "memory_log_path": None,
         "results_dir": str(LOCAL_DIR / "logs" / mode / run_id),
     })
     stage = "ANALYSIS"
+    llm_execution = None
     try:
-        graph = TradingAgentsGraph(
-            selected_analysts=("market", "news"), debug=False, config=config,
+        def analyze(analysis_config):
+            checkpoint("analysis")
+            if fast:
+                review, material, error, attempted = None, None, None, False
+                if technical["signal"]["allowed"]:
+                    try:
+                        material = news_material(collected_news, args.korea_ticker, args.date, datetime.now(KOREA_TZ))
+                        attempted = True
+                        review = review_news(material, analysis_config)
+                    except ValueError as exc:
+                        # Malformed/truncated/cross-ticker evidence is REVIEW, never a trusted HOLD.
+                        error = str(exc)
+                final_state = build_state(args.korea_ticker, args.date, analysis_config, technical, review, material, error)
+                final_state["news_execution"] = {**(review or {}), "attempted": attempted,
+                    "llmCalled": attempted and not (review or {}).get("cacheHit", False),
+                    "status": "validated" if review else "validation-failed" if error else "not-required"}
+                return IntradayReport(analysis_config), final_state, final_state["final_trade_decision"]
+            graph = TradingAgentsGraph(
+                selected_analysts=("market", "news"), debug=False, config=analysis_config,
+            )
+            final_state, decision = graph.propagate(args.korea_ticker, args.date)
+            return graph, final_state, decision
+
+        def record_switch(effective, audit):
+            store.change_routing(run_id, describe_routing(effective), audit)
+            notify(args, "errors", "OpenAI 크레딧 소진 · 로컬 LLM 전환",
+                   [f"분석 모델: {effective['quick_think_llm']} / {effective['deep_think_llm']}"],
+                   key="credit:" + str((audit.get("fallback") or {}).get("detectedAt")))
+            print(f"[LLM] OpenAI credit exhausted: switching analysis to Ollama "
+                  f"({effective['quick_think_llm']} / {effective['deep_think_llm']}).")
+
+        # Retry only analysis, before planning or any broker side effect.
+        config, (graph, final_state, decision), llm_execution = await asyncio.to_thread(run_with_credit_fallback,
+            config, enabled=getattr(args, "openai_credit_fallback", True),
+            local_models={"quick": args.ollama_quick_model, "deep": args.ollama_deep_model,
+                          "url": args.ollama_base_url},
+            analyze=analyze,
+            on_switch=record_switch,
         )
-        final_state, decision = graph.propagate(args.korea_ticker, args.date)
+        store.event(run_id, "LLM_EXECUTION", llm_execution)
         store.save_analysis(run_id, final_state)
         report_path = graph.save_reports(final_state, args.korea_ticker)
         checkpoint("planning")
@@ -2072,8 +2297,12 @@ async def run_korea_toss(args: argparse.Namespace, *, execute: bool) -> dict[str
             store.event(run_id, stage, {"plan": plan.__dict__, "fillVerified": False})
             risk = getattr(args, "_position_manager", None)
             if risk:
-                executor = risk.execute_with_watch if args.run_mode == "daily-market" else risk.execute
+                executor = risk.execute_with_watch if args.run_mode == "daily-market" and not fast else risk.execute
                 execution = await asyncio.to_thread(executor, plan, run_id)
+            elif fast:
+                # Fast rules never bypass the final account/quote/risk gate, even in one-shot mode.
+                execution = {"ok": False, "executed": False, "dryRun": not execute,
+                             "skipped": "position-manager-required", "plan": plan.__dict__}
             else:
                 execution = await execute_plan(
                     plan, execute=execute,
@@ -2084,9 +2313,13 @@ async def run_korea_toss(args: argparse.Namespace, *, execute: bool) -> dict[str
         stage = "RESULT_PERSISTENCE"
         store.event(run_id, "RESULT", {"execution": execution, "fillVerified": execution.get("fillVerified", False), "realizedPnl": None})
     except BaseException as exc:
+        llm_execution = getattr(exc, "llm_execution", None) or llm_execution
+        if llm_execution:
+            exc.llm_execution = llm_execution
         store.event(run_id, "INTERRUPTED" if isinstance(exc, RunStopped) or not isinstance(exc, Exception) else "ERROR", {
             "stage": stage, "error": str(exc), "errorType": type(exc).__name__,
             "newsExecution": getattr(exc, "news_execution", None),
+            "llmExecution": llm_execution,
             "fillVerified": False, "realizedPnl": None,
         })
         raise
@@ -2094,19 +2327,23 @@ async def run_korea_toss(args: argparse.Namespace, *, execute: bool) -> dict[str
         "scenario": "korea-execute" if execute else "korea-dry-run",
         "ticker": args.korea_ticker,
         "date": args.date,
-        "provider": args.provider,
-        "quickModel": quick_model,
-        "deepModel": deep_model,
-        "backendUrl": backend_url,
+        "requestedProvider": args.provider,
+        "provider": config["llm_provider"],
+        "quickModel": config["quick_think_llm"],
+        "deepModel": config["deep_think_llm"],
+        "backendUrl": config.get("backend_url"),
+        "llmExecution": llm_execution,
         "agentRouting": describe_routing(config),
         "ok": execution.get("ok", (execution.get("paperExecution") or {}).get("status") != "SIMULATED_REJECTED"),
         "decision": decision,
         "reportPath": str(report_path),
         "collectedNews": collected_news,
         "newsExecution": final_state.get("news_execution"),
+        "analysisEngine": "rules-news" if fast else "multi-agent",
+        "intradayContract": final_state.get("intraday_contract"),
         "accountContext": config.get("account_context"),
         "toss": execution,
-        "learning": {"enabled": True, "kind": "experience-retrieval", "runId": run_id, "database": str(store.path)},
+        "learning": {"enabled": not fast, "kind": "audit-only" if fast else "experience-retrieval", "runId": run_id, "database": str(store.path)},
     }
 
 
@@ -2123,7 +2360,7 @@ async def run_auto_live(args: argparse.Namespace) -> dict[str, Any]:
     args.date = run_date
     if not is_regular_market_open(datetime.now(KOREA_TZ), open_text=args.market_open, close_text=args.market_close, holidays=holiday_dates(args.holiday_dates)):
         raise ValueError("Live trading can only execute during the configured regular session.")
-    slot = active_trading_slot(datetime.now(KOREA_TZ))
+    slot = active_trading_slot(datetime.now(KOREA_TZ), args)
     requested_slot = getattr(args, "_schedule_slot", None)
     if args.run_mode == "daily-market" and requested_slot is not None and requested_slot != slot:
         raise ValueError("Scheduled trading slot is no longer current.")
@@ -2138,17 +2375,40 @@ async def run_auto_live(args: argparse.Namespace) -> dict[str, Any]:
 
 def screen_candidate_snapshot(args, snapshot):
     settings = {key: getattr(args, key, value) for key, value in INTRADAY_DEFAULTS.items()}
+    settings.update({key: getattr(args, key, value) for key, value in TIME_DEFAULTS.items()})
     settings.update(market_open=args.market_open, market_close=args.market_close,
-                    holiday_dates=args.holiday_dates, buy_cutoff_minutes=args.buy_cutoff_minutes)
+                    holiday_dates=args.holiday_dates, buy_cutoff_minutes=args.buy_cutoff_minutes,
+                    liquidation_minutes=args.liquidation_minutes)
+    if uses_intraday_rules(args):
+        settings["per_trade_budget"] = str(order_budget(args))
     risk = getattr(args, "_position_manager", None)
     backend = risk.backend if isinstance(risk, PositionRiskManager) else BrokerBackend(LOCAL_DIR, False, args.paper_capital)
     screening = screen_candidates(snapshot["candidates"], backend, settings, requested_date=args.date)
+    if uses_intraday_rules(args) and isinstance(risk, PositionRiskManager) and screening["status"] in {"completed", "partial"}:
+        try:
+            exclusions = risk.candidate_exclusions([row["ticker"].split(".")[0] for row in screening["rows"]])
+            screening["portfolioExclusions"] = exclusions
+            for row in screening["rows"]:
+                reason = exclusions.get(row["ticker"].split(".")[0])
+                if reason:
+                    check = row["intraday"]
+                    check.update(eligible=False, watchable=False, state="EXCLUDED",
+                                 reasons=[*check["reasons"], reason])
+            screening["eligibleCount"] = sum(row["intraday"]["eligible"] for row in screening["rows"])
+        except RunStopped:
+            raise
+        except Exception as exc:
+            screening.update(status="failed", error=f"계좌 후보 검사 실패 ({type(exc).__name__}); 신규 진입 차단", eligibleCount=0)
+            for row in screening["rows"]:
+                row["intraday"].update(eligible=False, watchable=False, reasons=[screening["error"]])
     snapshot["candidates"] = screening.pop("rows")
     snapshot["intradayScreen"] = screening
     snapshot["warnings"] = list(dict.fromkeys([
         *(snapshot.get("warnings") or []), *(screening.get("warnings") or []),
     ]))
-    snapshot["selectionReason"] = screening["error"] or (None if screening["eligibleCount"] else "단타 시장자료 조건을 통과한 후보 없음; 신규 분석/주문 생략")
+    snapshot["selectionReason"] = screening["error"] or screening.get("notice") or (None if screening["eligibleCount"] else "단타 시장자료 조건을 통과한 후보 없음; 신규 분석/주문 생략")
+    if uses_intraday_rules(args) and not screening["error"] and any(row["intraday"].get("watchable") for row in snapshot["candidates"]):
+        snapshot["selectionReason"] = screening.get("notice") or "거래량 관찰 후보 포함; 매수 조건은 최신 분봉으로 재검사"
     if screening["status"] == "failed":
         snapshot["ok"] = False
     if snapshot.get("jsonPath"):
@@ -2165,6 +2425,8 @@ def screen_candidate_snapshot(args, snapshot):
         reference = screening.get("marketReference")
         if reference:
             lines.append(f"- KOSPI / stock comparison window: {reference['basisStart']} to {reference['barEnd']}")
+        if screening.get("notice"):
+            lines.append(f"- Assessment: {screening['notice']}")
         lines.extend(f"- Warning: {warning}" for warning in screening.get("warnings", []))
         lines.extend(["", "| Ticker | News rank | Intraday score | Eligible | Reasons |", "|---|---:|---:|---|---|"])
         for row in snapshot["candidates"]:
@@ -2180,10 +2442,11 @@ async def run_auto_trading(args: argparse.Namespace, *, execute: bool) -> dict[s
     if execute and not args.yes:
         raise SystemExit("Actual Toss orders require --yes.")
     scenario = "auto-live" if execute else "auto-paper"
+    notify(args, "analysis", "후보 선정·분석 시작", [f"분석 방식: {args.intraday_engine}"])
     if not args.date:
         args.date = today_korea().isoformat()
     quick_model, deep_model, backend_url = resolve_models(args)
-    candidate_snapshot = collect_candidate_snapshot(args)
+    candidate_snapshot = await asyncio.to_thread(discovery_for_scan, args)
     checkpoint("candidates-collected")
     selection_ok = candidate_snapshot.get("ok") is True
     selection_reason = candidate_snapshot.get("selectionReason") or candidate_snapshot.get("error")
@@ -2203,7 +2466,8 @@ async def run_auto_trading(args: argparse.Namespace, *, execute: bool) -> dict[s
         checkpoint("candidate-screened")
         selection_ok = candidate_snapshot["ok"]
         selection_reason = candidate_snapshot.get("selectionReason")
-        candidates = [row for row in candidate_snapshot["candidates"] if row["intraday"]["eligible"]] if selection_ok else []
+        candidates = [row for row in candidate_snapshot["candidates"] if row["intraday"]["eligible"]
+                      or (uses_intraday_rules(args) and row["intraday"].get("watchable"))] if selection_ok else []
     candidate_names = {row["ticker"]: row.get("name") for row in candidates}
     tickers = [row["ticker"] for row in candidates[: max(args.trade_candidates, 0)]]
     if not tickers and not selection_reason:
@@ -2211,6 +2475,8 @@ async def run_auto_trading(args: argparse.Namespace, *, execute: bool) -> dict[s
 
     analyses: list[dict[str, Any]] = []
     original_ticker = args.korea_ticker
+    original_fast = getattr(args, "_intraday_fast", False)
+    args._intraday_fast = uses_intraday_rules(args)
     try:
         for ticker in tickers:
             checkpoint("next-candidate")
@@ -2231,11 +2497,15 @@ async def run_auto_trading(args: argparse.Namespace, *, execute: bool) -> dict[s
             except RunStopped:
                 raise
             except Exception as exc:
+                llm_execution = getattr(exc, "llm_execution", None) or {}
                 result = {
                     "scenario": "korea-execute" if execute else "korea-dry-run",
                     "ticker": ticker,
                     "date": args.date,
-                    "provider": args.provider,
+                    "requestedProvider": args.provider,
+                    "provider": llm_execution.get("provider", args.provider),
+                    "agentRouting": llm_execution.get("agentRouting", {}),
+                    "llmExecution": llm_execution,
                     "candidateRank": candidate_rank,
                     "ok": False,
                     "error": str(exc),
@@ -2245,10 +2515,12 @@ async def run_auto_trading(args: argparse.Namespace, *, execute: bool) -> dict[s
             analyses.append(result)
     finally:
         args.korea_ticker = original_ticker
+        args._intraday_fast = original_fast
 
     summary = {
         "ok": selection_ok and all(row.get("ok", True) for row in analyses) and len(analyses) == len(tickers),
         "selectionReason": selection_reason,
+        "marketGate": (candidate_snapshot.get("intradayScreen") or {}).get("marketGate"),
         "scenario": scenario,
         "executionMode": "live" if execute else "dry-run",
         "date": args.date,
@@ -2263,6 +2535,8 @@ async def run_auto_trading(args: argparse.Namespace, *, execute: bool) -> dict[s
         "perTradeBudget": str(order_budget(args)),
         "tradingObjective": trading_objective(args),
         "runMode": args.run_mode,
+        "analysisEngine": getattr(args, "intraday_engine", "multi-agent"),
+        "candidateScanMinutes": args.candidate_scan_minutes,
         "scheduleSlot": getattr(args, "_schedule_slot", None),
         "marketHours": {
             "timezone": "Asia/Seoul",
@@ -2283,6 +2557,7 @@ async def run_auto_trading(args: argparse.Namespace, *, execute: bool) -> dict[s
     output_path = output_dir / f"{prefix}_{args.date}_{datetime.now():%Y%m%d_%H%M%S_%f}.json"
     atomic_write_json(output_path, summary)
     summary["summaryPath"] = str(output_path)
+    analysis_notification(args, summary)
     return summary
 
 
@@ -2302,7 +2577,8 @@ def require_resolved_live_orders():
 
 async def run_manual_job(base_args, control, job):
     # Freeze settings when queued; later web edits cannot mutate a running job.
-    args = argparse.Namespace(**deepcopy({key: value for key, value in vars(base_args).items() if key not in {"_controller", "_position_manager"}}))
+    args = argparse.Namespace(**deepcopy({key: value for key, value in vars(base_args).items() if key not in {"_controller", "_position_manager", "_telegram"}}))
+    args._telegram = getattr(base_args, "_telegram", None)
     args._position_manager = getattr(base_args, "_position_manager", None)
     for key, value in job["settings"].items():
         setattr(args, key, value)
@@ -2324,6 +2600,7 @@ async def run_manual_job(base_args, control, job):
             elif job["action"] == "candidates":
                 result = collect_candidate_snapshot(args)
             elif job["action"] == "analyze":
+                args._intraday_fast = uses_intraday_rules(args)
                 result = await run_korea_toss(args, execute=control.live)
             else:
                 if not is_regular_market_open(datetime.now(KOREA_TZ), open_text=args.market_open,
@@ -2331,7 +2608,7 @@ async def run_manual_job(base_args, control, job):
                     raise ValueError("대기 중 정규장이 종료되어 매매를 실행하지 않았습니다.")
                 if control.live:
                     require_resolved_live_orders()
-                slot = active_trading_slot(datetime.now(KOREA_TZ))
+                slot = active_trading_slot(datetime.now(KOREA_TZ), args)
                 args._schedule_slot = slot
                 if not has_scheduler_completed(args.date, args.scenario, slot):
                     mark_run_started(args.date, args.scenario, slot)
@@ -2346,6 +2623,10 @@ async def run_manual_job(base_args, control, job):
         status, result = "failed", {"ok": False, "error": str(exc)}
     finally:
         control.finish(status, result)
+        if status in {"failed", "completed-with-errors", "stopped"}:
+            notify(args, "errors", "수동 작업 종료 · 확인 필요", [f"작업 {job['action']} · {status}", "상세 원인은 대시보드에서 확인하세요."], key="manual:" + job["id"])
+        elif job["action"] == "analyze" and isinstance(result, dict):
+            analysis_notification(args, {"analyses": [result], "ok": True})
         if reserved_slot:
             mark_scheduler_completed(args.date, (result or {}).get("summaryPath"), status,
                                      scenario=args.scenario, slot=reserved_slot)
@@ -2361,6 +2642,61 @@ async def scheduler_wait(args, seconds):
         await asyncio.sleep(seconds)
 
 
+async def run_due_postmarket_review(args, now):
+    risk = getattr(args, "_position_manager", None)
+    if not getattr(args, "postmarket_review", True) or not isinstance(risk, PositionRiskManager):
+        return
+    if now.weekday() >= 5 or now.date() in holiday_dates(args.holiday_dates):
+        return
+    close = max(parse_hhmm(args.market_close), time(15, 30))
+    if now < datetime.combine(now.date(), close, tzinfo=KOREA_TZ) + timedelta(minutes=5):
+        return
+    mode = "live" if risk.live else "dry-run"
+    path = postmarket.state_path(LOCAL_DIR, mode, risk.store.path.stem)
+    record = read_json_file(path) or {}
+    if not isinstance(record, dict):
+        record = {}
+    if (record.get("date") == now.date().isoformat()
+            and (record.get("status") == "completed" or record.get("reviewFinished"))
+            and (record.get("candidateReview") or {}).get("version") == candidate_review.VERSION):
+        return
+    retry = getattr(args, "_postmarket_retry", {})
+    key = (mode, risk.store.path.stem, now.date().isoformat())
+    if retry.get("key") == key and now < retry["after"]:
+        return
+    args._postmarket_retry = {"key": key, "after": now + timedelta(minutes=15)}
+    try:
+        # Check the disk first, so unplugging it does not trigger futile API traffic.
+        await asyncio.to_thread(postmarket.archive_available)
+        try:
+            market = await asyncio.to_thread(postmarket.collect_market, risk.backend, now.date())
+        except Exception as exc:
+            market = {"status": "unavailable", "errorType": type(exc).__name__}
+        if market.get("status") == "not-due":
+            args._postmarket_retry["after"] = datetime.fromisoformat(market["dueAt"])
+            return
+        if market.get("status") == "closed":
+            args._postmarket_retry["after"] = now + timedelta(days=1)
+            return
+        result = await asyncio.to_thread(postmarket.run_review, LOCAL_DIR, mode, now.date(), risk.store.path,
+                                         now=now, market=market, backend=risk.backend)
+        notify(args, "review", "장 마감 복기", [f"거래일 {result.get('date')} · {result.get('status')}",
+               f"완료 거래 {result.get('roundTrips')}건 · 순실현손익 {result.get('netRealizedPnl')}원"],
+               key=f"review:{now.date()}:{result.get('status')}")
+        print(json.dumps({"postmarketReview": {key: result.get(key) for key in
+              ("date", "status", "roundTrips", "netRealizedPnl", "reportPath")}}, ensure_ascii=False), flush=True)
+    except Exception as exc:
+        # Review/storage failures must not interrupt the independent exit monitor.
+        notify(args, "errors", "장 마감 복기 실패", ["External 연결·권한과 대시보드를 확인하세요."], key=f"review-error:{now.date()}")
+        failure = {"date": now.date().isoformat(), "mode": mode, "status": "retry-pending",
+                   "error": f"장 마감 복기 저장/분석 실패 ({type(exc).__name__}). External 연결과 쓰기 권한을 확인하세요.",
+                   "updatedAt": now.isoformat(), "retryAfter": args._postmarket_retry["after"].isoformat()}
+        try:
+            atomic_write_json(LOCAL_DIR / "postmarket" / f"latest-{mode}.json", failure)
+        except OSError:
+            print(json.dumps({"postmarketReview": failure}, ensure_ascii=False), flush=True)
+
+
 async def run_daily_market_scheduler(args: argparse.Namespace) -> int:
     scenario = auto_scenario(args)
     if scenario == "auto-live" and not args.yes:
@@ -2374,7 +2710,10 @@ async def run_daily_market_scheduler(args: argparse.Namespace) -> int:
         "timezone": "Asia/Seoul",
         "marketOpen": args.market_open,
         "marketClose": args.market_close,
-        "additionalRunTime": AFTERNOON_RUN_TIME,
+        "candidateScanMinutes": args.candidate_scan_minutes,
+        "buyStartMinutes": args.buy_start_minutes,
+        "buyCutoffMinutes": args.buy_cutoff_minutes,
+        "carryExitMinutes": args.carry_exit_minutes,
         "paperCapital": args.paper_capital,
         "targetScope": "position",
         "positionTargetReturn": getattr(args, "position_target_return", ".01"),
@@ -2384,6 +2723,9 @@ async def run_daily_market_scheduler(args: argparse.Namespace) -> int:
     write_monitor_status("scheduler-started", **startup_status)
     print(json.dumps({"status": "scheduler-started", **startup_status}, ensure_ascii=False), flush=True)
     while True:
+        # Read-only review is independent of the manual trading pause switch.
+        apply_trading_settings(args)
+        await run_due_postmarket_review(args, datetime.now(KOREA_TZ))
         control = getattr(args, "_controller", None)
         if control:
             job = control.start()
@@ -2403,15 +2745,29 @@ async def run_daily_market_scheduler(args: argparse.Namespace) -> int:
             close_text=args.market_close,
             holidays=holidays,
         ):
-            slot = active_trading_slot(now)
-            entry_ready = datetime.combine(now.date(), parse_hhmm(args.market_open), tzinfo=KOREA_TZ) + timedelta(minutes=20)
-            if slot == "morning" and now < entry_ready:
-                write_monitor_status("waiting-for-completed-bars", **mode_status,
+            try:
+                entry_window = await asyncio.to_thread(scheduled_entry_window, now, args)
+            except Exception as exc:
+                write_monitor_status("market-calendar-unavailable", **mode_status, error=type(exc).__name__)
+                await scheduler_wait(args, max(args.scheduler_poll_seconds, 1))
+                continue
+            if not entry_window or entry_window[0] >= entry_window[1]:
+                write_monitor_status("entry-window-closed", **mode_status, date=run_date)
+                await scheduler_wait(args, max(args.scheduler_poll_seconds, 1))
+                continue
+            entry_ready, cutoff = entry_window
+            slot = active_trading_slot(now, args, entry_window)
+            if now < entry_ready:
+                write_monitor_status("waiting-for-entry-window", **mode_status,
                                      nextRunAfter=entry_ready.isoformat(timespec="seconds"))
                 await scheduler_wait(args, min(max(1, int((entry_ready - now).total_seconds())), max(args.scheduler_poll_seconds, 1)))
                 continue
+            if now >= cutoff:
+                write_monitor_status("entry-window-closed", **mode_status, date=run_date)
+                await scheduler_wait(args, max(args.scheduler_poll_seconds, 1))
+                continue
             if has_scheduler_completed(run_date, scenario, slot):
-                next_open = next_trading_slot_time(now, args, holidays)
+                next_open = next_trading_slot_time(now, args, holidays, entry_window)
                 wait_seconds = max(1, int((next_open - now).total_seconds()))
                 status_payload = {
                     **mode_status,
@@ -2423,7 +2779,7 @@ async def run_daily_market_scheduler(args: argparse.Namespace) -> int:
                 outcome = load_scheduler_state(scenario)["runs"][run_date]["slots"][slot]["status"]
                 if outcome == "started":
                     outcome = "interrupted-live-run" if scenario == "auto-live" else "interrupted-paper-run"
-                wait_status = "waiting-for-afternoon-run" if next_open.date() == now.date() else "already-completed"
+                wait_status = "waiting-for-next-scan" if next_open.date() == now.date() else "already-completed"
                 if outcome != "completed":
                     wait_status = outcome
                 write_monitor_status(wait_status, **status_payload)
@@ -2453,6 +2809,7 @@ async def run_daily_market_scheduler(args: argparse.Namespace) -> int:
                     summary = await (run_auto_live(args) if scenario == "auto-live" else run_auto_paper(args))
             except Exception as exc:
                 summary = {**mode_status, "ok": False, "date": run_date, "scheduleSlot": slot, "error": str(exc)}
+                notify(args, "errors", "자동 분석 중단", [f"{run_date} · {slot} · {type(exc).__name__}", "대시보드에서 상세 원인을 확인하세요."], key=f"run-error:{run_date}:{slot}")
                 if isinstance(exc, RunStopped):
                     summary["stopped"] = True
                 prefix = scenario.replace("-", "_")
@@ -2517,6 +2874,11 @@ async def main_async() -> int:
     args._explicit_settings = {
         item.split("=", 1)[0][2:].replace("-", "_") for item in sys.argv[1:] if item.startswith("--")
     }
+    if "no_openai_credit_fallback" in args._explicit_settings:
+        args._explicit_settings.add("openai_credit_fallback")
+    for key in {**postmarket.DEFAULTS, **TELEGRAM_DEFAULTS}:
+        if "no_" + key in args._explicit_settings:
+            args._explicit_settings.add(key)
     with scheduler_process_lock(args):
         return await _main_async(args)
 
@@ -2541,6 +2903,11 @@ async def _main_async(args: argparse.Namespace) -> int:
         risk = PositionRiskManager(LOCAL_DIR, live=live, settings=lambda: {**default_settings(args), **load_trading_settings()})
         args._position_manager = risk
     monitor_server = None
+    telegram = None
+    if args.scenario in AUTO_SCENARIOS | {"korea-dry-run", "korea-execute"}:
+        telegram = TelegramNotifier(LOCAL_DIR, "live" if args.scenario in {"auto-live", "korea-execute"} else "dry-run",
+            lambda: {**default_settings(args), **load_trading_settings()}, risk_path=risk.store.path if risk else None)
+        args._telegram = telegram
     if args.monitor:
         control = None
         if args.scenario in AUTO_SCENARIOS and args.run_mode == "daily-market":
@@ -2553,7 +2920,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                         return "cancel"
                     return "wait" if state["active"] or state["pending"] else "ready"
                 risk.entry_watch.guard = watch_guard
-        monitor_server = start_monitor_server(args.monitor_host, args.monitor_port, scenario=args.scenario, control=control, risk=risk)
+        monitor_server = start_monitor_server(args.monitor_host, args.monitor_port, scenario=args.scenario, control=control, risk=risk, telegram=telegram)
         monitor_url = getattr(monitor_server, "monitor_url", f"http://{args.monitor_host}:{args.monitor_port}")
         monitor_token = ensure_monitor_token()
         print(
@@ -2576,9 +2943,17 @@ async def _main_async(args: argparse.Namespace) -> int:
         )
 
     try:
+        if telegram:
+            telegram.start()
+            objective = trading_objective(args)
+            telegram.emit("system", "프로그램 시작", [f"매수 시간 {objective['buy_start']}~{objective['buy_cutoff']} (마감 시각 제외)",
+                f"후보 분석 {args.candidate_scan_minutes}분 주기 · 당일 청산 원칙"])
         if risk:
             risk.start()
         return await run_scenarios(args)
+    except BaseException as exc:
+        notify(args, "errors", "프로그램 중단", [type(exc).__name__, "대시보드와 터미널 상태를 확인하세요."])
+        raise
     finally:
         if risk:
             await asyncio.to_thread(risk.stop)
@@ -2587,6 +2962,9 @@ async def _main_async(args: argparse.Namespace) -> int:
             monitor_server.account_stop.set()
             monitor_server.shutdown()
             monitor_server.server_close()
+        if telegram:
+            telegram.emit("system", "프로그램 종료", ["자동 분석과 보유 점검이 종료됩니다. 남은 보유분·주문은 직접 확인하세요."])
+            await asyncio.to_thread(telegram.stop)
 
 
 async def run_scenarios(args: argparse.Namespace) -> int:

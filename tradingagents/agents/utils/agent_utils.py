@@ -107,9 +107,12 @@ def get_trading_objective_instruction() -> str:
             f"- Aim to buy and sell within the same trading day, targeting +{target_label} gross price return per position, not account-wide daily profit.",
             "- For BUY, explain the same-day catalyst, verified entry trigger, liquidity, target feasibility and invalidation/stop condition. Multi-month valuation is background, not a sufficient entry reason.",
             f"- Take-profit rule: actual average entry price * (1 + {target_return}); stop distance must respect the configured limit. Do not invent live prices or promise a fill.",
+            f"- New entries begin at {objective.get('buy_start', 'the configured entry start')} Asia/Seoul. Reassess candidates every {objective.get('candidate_scan_minutes', 'configured')} minutes; protective exits and fill checks run independently.",
             f"- Stop new entries at {objective.get('buy_cutoff', 'the configured cutoff')}; start liquidation at {objective.get('liquidation_start', 'the configured liquidation time')} Asia/Seoul, even if the profit target has not been reached. Market close: {objective.get('market_close', 'configured close')}.",
             "- HOLD with no shares means no entry this round: specify the unmet trigger, missing data or risk/reward problem. HOLD with shares never cancels stop-loss, take-profit or scheduled liquidation.",
-            "- No automatic overnight extension while waiting for profit. Only explicit user approval allows at most two trading sessions including acquisition day.",
+            (f"- No automatic overnight extension while waiting for profit. Only explicit user approval permits carry; exit within {objective['carry_exit_minutes']} minutes (at most 60) after the NEXT trading session opens. Use the exchange calendar, not calendar days."
+             if objective.get('carry_exit_minutes') else
+             "- No automatic overnight extension while waiting for profit. Only explicit user approval allows at most two trading sessions including acquisition day."),
             "- Your final summary/action plan must state the configured target, entry or no-entry reason, stop/exit rule and same-day horizon. Distinguish policy targets from observed evidence and actual execution.",
             "- If evidence is insufficient, choose HOLD or REVIEW rather than inventing a setup or forcing a trade.",
         ])

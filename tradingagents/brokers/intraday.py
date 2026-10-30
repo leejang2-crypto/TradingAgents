@@ -6,11 +6,20 @@ Only complete regular-session bars are accepted; missing data blocks entry.
 
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
+from collections import OrderedDict
+from copy import deepcopy
+import threading
 import time
 
 import pandas as pd
 
 from .paper_account import KST, number
+from .toss_transport import check_read_deadline
+
+
+_SESSION_CACHE = OrderedDict()
+_SESSION_CACHE_LOCK = threading.Lock()
+SESSION_CACHE_SECONDS = 30
 
 
 INTRADAY_DEFAULTS = {
@@ -87,13 +96,24 @@ def candle_coverage(timestamps, start, now, minimum_minutes=20, *, allow_opening
             "unexpectedCount": len(unexpected), "unexpectedAt": [at.isoformat() for at in unexpected]}
 
 
-def session_candles(call, symbol, start, now, *, index=False, diagnostics=None):
+def session_candles(call, symbol, start, now, *, index=False, diagnostics=None, cache_namespace=None):
     """Fetch to the opening boundary, then repair gaps using only actual API bars."""
     result, cursor, seen = {}, now.isoformat(), set()
     info = diagnostics if diagnostics is not None else {}
     info.update(symbol=symbol, timestampKind="start" if index else "end", pageCount=0, retryCount=0, pages=[])
     offset = timedelta(minutes=1) if index else timedelta(0)
     end = stamp(candle_coverage([], start, now)["expectedEnd"])
+    cache_key = (cache_namespace, symbol, index, start.isoformat(), end.isoformat())
+    check_read_deadline()
+    if cache_namespace:
+        with _SESSION_CACHE_LOCK:
+            cached = _SESSION_CACHE.get(cache_key)
+            if cached and 0 <= time.monotonic() - cached[0] < SESSION_CACHE_SECONDS:
+                info.update(deepcopy(cached[2]), asOf=now.isoformat(), cacheHit=True,
+                            cacheAgeSeconds=round(time.monotonic() - cached[0], 3))
+                _SESSION_CACHE.move_to_end(cache_key)
+                return deepcopy(cached[1])
+            _SESSION_CACHE.pop(cache_key, None)
 
     def coverage():
         info.update(candle_coverage(result, start, now))
@@ -102,6 +122,7 @@ def session_candles(call, symbol, start, now, *, index=False, diagnostics=None):
     def fetch(before):
         from tradingagents.monitoring.control import checkpoint
         checkpoint()
+        check_read_deadline()
         data = call("get_candles", symbol, before=before, index=index)
         rows = data.get("candles")
         if not isinstance(rows, list):
@@ -165,7 +186,18 @@ def session_candles(call, symbol, start, now, *, index=False, diagnostics=None):
         if info["code"] != "opening-gap":
             raise CandleDataError(info)
         info["warning"] = "지수 개장 첫 1분 누락 허용: 첫 실제 관측 봉 기준, 첫 1분 변동 미반영"
-    return list(result.values())
+    rows = list(result.values())
+    if cache_namespace:
+        # Cache only validated, completed snapshots. Never cache errors/forming bars.
+        _minute_frame(rows, start, now, index=index)
+        check_read_deadline()
+        info["cacheHit"] = False
+        with _SESSION_CACHE_LOCK:
+            _SESSION_CACHE[cache_key] = (time.monotonic(), deepcopy(rows), deepcopy(info))
+            _SESSION_CACHE.move_to_end(cache_key)
+            while len(_SESSION_CACHE) > 128:
+                _SESSION_CACHE.popitem(last=False)
+    return rows
 
 
 def _minute_frame(rows, start, now, *, index=False, minimum_minutes=20):
@@ -217,6 +249,45 @@ def bars(rows, start, now, *, index=False, minimum_minutes=20):
     return five, turnover, turnover / volume if volume else 0
 
 
+def relative_volume(five):
+    # The opening auction/first 5m burst is not a continuous-session baseline.
+    # Require at least two completed non-opening reference bars; never use future bars.
+    history = five.volume.iloc[max(1, len(five) - 7):-1]
+    average = float(history.mean()) if len(history) >= 2 else 0
+    return float(five.volume.iloc[-1]) / average if average > 0 else 0
+
+
+def entry_pattern_reasons(five, rows, start, vwap, cfg):
+    """Shared chart pattern checks for live entries and read-only historical review."""
+    last, prior = five.iloc[-1], five.iloc[-2]
+    reasons = []
+    def require(condition, reason):
+        if not condition:
+            reasons.append(reason)
+    if cfg["entry_strategy"] == "breakout":
+        require(last.close > five.high.iloc[-4:-1].max(), "직전 15분 고점 돌파 미확인")
+    elif cfg["entry_strategy"] == "opening_range":
+        minutes = int(cfg["opening_range_minutes"])
+        if minutes < 5 or minutes > 60 or minutes % 5:
+            raise ValueError("Opening range must be 5-60 minutes in 5-minute steps")
+        opening_end = start + timedelta(minutes=minutes)
+        opening = five.loc[five.index <= opening_end]
+        require(five.index[-1] > opening_end, "장 초반 범위 형성 중")
+        require(last.close > opening.high.max() and prior.close <= opening.high.max(),
+                "장 초반 고점의 신규 돌파 미확인")
+    elif cfg["entry_strategy"] == "pullback":
+        require(last.low <= vwap <= last.close and last.close > prior.close and last.close > last.open,
+                "VWAP 눌림목 회복 미확인")
+    elif cfg["entry_strategy"] == "vwap_reclaim":
+        previous_rows = [row for row in rows if stamp(row["timestamp"]) <= five.index[-2]]
+        _, _, previous_vwap = bars(previous_rows, start, five.index[-2].to_pydatetime(), minimum_minutes=15)
+        require(prior.close <= previous_vwap and last.close > vwap and last.close > last.open,
+                "VWAP 하단에서 상단으로의 재돌파 미확인")
+    else:
+        raise ValueError("Unknown entry strategy")
+    return reasons
+
+
 def evaluate_entry(symbol, rows, book, markets, start, now, settings):
     cfg = {**INTRADAY_DEFAULTS, **settings}
     five, turnover, vwap = bars(rows, start, now)
@@ -230,8 +301,7 @@ def evaluate_entry(symbol, rows, book, markets, start, now, settings):
         raise ValueError("Invalid KR orderbook prices")
     spread = (ask - bid) / ask
     last, prior = five.iloc[-1], five.iloc[-2]
-    average_volume = five.volume.iloc[max(0, len(five) - 7):-1].mean()
-    relative = float(last.volume / average_volume) if average_volume > 0 else 0
+    relative = relative_volume(five)
     previous_close = five.close.shift(1)
     tr = pd.concat([five.high - five.low, (five.high - previous_close).abs(), (five.low - previous_close).abs()], axis=1).max(axis=1)
     atr = number(str(tr.tail(14).mean()))
@@ -251,28 +321,7 @@ def evaluate_entry(symbol, rows, book, markets, start, now, settings):
     require(min(returns.values()) > -float(cfg["market_drop_limit"]), "시장 지수 하락 제한")
     require(last.close > vwap and bid > number(str(vwap)), "당일 추정 VWAP 하회")
     require(abs(ask / number(str(last.close)) - 1) <= number(cfg["max_entry_extension"]), "신호 가격 이탈 / 추격 매수 차단")
-    if cfg["entry_strategy"] == "breakout":
-        require(last.close > five.high.iloc[-4:-1].max(), "직전 15분 고점 돌파 미확인")
-    elif cfg["entry_strategy"] == "opening_range":
-        minutes = int(cfg["opening_range_minutes"])
-        if minutes < 5 or minutes > 60 or minutes % 5:
-            raise ValueError("Opening range must be 5-60 minutes in 5-minute steps")
-        opening_end = start + timedelta(minutes=minutes)
-        opening = five.loc[five.index <= opening_end]
-        require(five.index[-1] > opening_end, "장 초반 범위 형성 중")
-        require(last.close > opening.high.max() and prior.close <= opening.high.max(),
-                "장 초반 고점의 신규 돌파 미확인")
-    elif cfg["entry_strategy"] == "pullback":
-        require(last.low <= vwap <= last.close and last.close > prior.close and last.close > last.open,
-                "VWAP 눌림목 회복 미확인")
-    elif cfg["entry_strategy"] == "vwap_reclaim":
-        # Compare each close against the VWAP known at that bar, not today's later VWAP.
-        previous_rows = [row for row in rows if stamp(row["timestamp"]) <= five.index[-2]]
-        _, _, previous_vwap = bars(previous_rows, start, five.index[-2].to_pydatetime(), minimum_minutes=15)
-        require(prior.close <= previous_vwap and last.close > vwap and last.close > last.open,
-                "VWAP 하단에서 상단으로의 재돌파 미확인")
-    else:
-        raise ValueError("Unknown entry strategy")
+    reasons.extend(entry_pattern_reasons(five, rows, start, vwap, cfg))
     # ATR/previous-low stop is capped at the configured maximum loss distance.
     stop = max(ask * (1 - number(cfg["position_stop_loss"])), ask - atr, number(str(prior.low)))
     require(stop < bid, "손절선이 현재 매수호가 이상")

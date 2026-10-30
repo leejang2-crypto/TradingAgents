@@ -17,7 +17,8 @@
       const rows = Object.values(data.positions || {}).filter(p => Number(p.quantity) > 0).map(p => {
         const row = document.createElement('tr');
         const price = value => value == null ? '-' : Number(value).toLocaleString('ko-KR', {maximumFractionDigits: 2});
-        [p.symbol, p.quantity, price(p.averagePrice), p.returnPct == null ? '-' : Number(p.returnPct).toFixed(2) + '%', price(p.targetPrice) + ' / ' + price(p.stopPrice), p.acquiredDate, p.maxHoldingDate || '거래일 확인 중'].forEach(v => row.append(text('td', v)));
+        const deadline = p.liquidationDeadlineAt ? p.liquidationDeadlineAt.replace('T', ' ').slice(0, 16) + ' KST' : p.maxHoldingDate || '거래일 확인 중';
+        [p.symbol, p.quantity, price(p.averagePrice), p.returnPct == null ? '-' : Number(p.returnPct).toFixed(2) + '%', price(p.targetPrice) + ' / ' + price(p.stopPrice), p.acquiredDate, deadline].forEach(v => row.append(text('td', v)));
         const cell = document.createElement('td');
         const input = document.createElement('input'); input.type = 'checkbox'; input.checked = p.carryApproved;
         input.setAttribute('aria-label', p.symbol + ' 이월 허용'); input.style.width = '20px'; input.style.height = '20px';
@@ -33,7 +34,7 @@
           finally { editing = false; input.disabled = false; if (saved) await refresh(); }
         });
         cell.append(input); row.append(cell);
-        row.append(text('td', p.alert || (p.liquidate ? '청산 진행 · ' + p.exitReason : p.carryApproved ? '익일 청산 대상' : '당일 청산 대상')));
+        row.append(text('td', (p.deadlineExceeded ? '청산 기한 초과 · 체결 확인 필요 · ' : '') + (p.alert || (p.liquidate ? '청산 진행 · ' + p.exitReason : p.carryApproved ? '익일 개장 후 청산 대상' : '당일 청산 대상'))));
         return row;
       });
       if (!rows.length) { const row = document.createElement('tr'); const cell = text('td', '관리 중인 보유분 없음'); cell.colSpan = 9; row.append(cell); rows.push(row); }

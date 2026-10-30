@@ -29,6 +29,7 @@ def test_layout_preserves_existing_controls_and_unique_ids():
         'account-message', 'account-results', 'account-source', 'account-metrics', 'account-note',
         'returns-title', 'account-returns', 'account-holdings', 'account-orders', 'logout',
         'settings-message', 'ollama-models', 'openai-models', 'ollama-status', 'agent-routing',
+        'telegram-status', 'telegram-test', 'telegram-recent',
     }
     assert required <= set(ids)
     assert {attrs['data-action'] for _, attrs in parsed.tags if 'data-action' in attrs} == {'news', 'candidates', 'analyze', 'trade'}
@@ -54,9 +55,11 @@ def test_tabs_details_and_new_assets_are_declared():
     assert [tab['data-view'] for tab in tabs] == ['overview', 'analysis', 'research', 'history', 'execution', 'settings']
     assert all(tab['aria-controls'] == 'view-' + tab['data-view'] for tab in tabs)
     groups = [attrs for tag, attrs in parsed.tags if tag == 'details' and attrs.get('class') == 'settings-group']
-    assert len(groups) == 5
+    assert len(groups) == 6
+    assert any(group['data-detail-key'] == 'settings-telegram' for group in groups)
     assert sum('open' in group for group in groups) == 1
     assert any(attrs.get('src') == '/assets/dashboard.js' for _, attrs in parsed.tags)
+    assert any(attrs.get('src') == '/assets/telegram.js' for _, attrs in parsed.tags)
     assert any(attrs.get('href') == '/assets/dashboard.css' for _, attrs in parsed.tags)
 
 

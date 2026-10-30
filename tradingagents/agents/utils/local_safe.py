@@ -14,6 +14,11 @@ _STOP_RE = re.compile(
     re.IGNORECASE,
 )
 _KRW_RE = re.compile(r"([0-9][0-9,]*(?:\.\d+)?)\s*원")
+_LABELED_PRICE_RE = re.compile(
+    r"(?:current\s+price|latest\s+close|closing\s+price|close\s+price)"
+    r"\s*(?::|=|\bis\b|\|)?\s*(?:KRW|₩|\$)?\s*([0-9][0-9,]*(?:\.\d+)?)",
+    re.IGNORECASE,
+)
 _KOREA_CODE_RE = re.compile(r"\b(\d{6})(?:\.KS)?\b", re.IGNORECASE)
 
 
@@ -36,6 +41,9 @@ def _extract_current_price(text: str) -> float | None:
         lower = line.lower()
         if any(label in lower for label in ("종가", "현재", "close", "latest")):
             match = _KRW_RE.search(line)
+            if match:
+                return _to_float(match.group(1))
+            match = _LABELED_PRICE_RE.search(line.replace("*", ""))
             if match:
                 return _to_float(match.group(1))
     # Fall back to the first KRW-denominated number in the market report.

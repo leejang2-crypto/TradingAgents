@@ -20,12 +20,14 @@ import uuid
 from .account_service import credentials, fetch_quotes, live_cache_path, paper_account
 from .paper_account import checked_quote, now_kst, number, KST
 from .toss_client import TossClient, OrderWindowClosed
+from .toss_transport import namespace, read_budget, check_read_deadline
 from .toss_executor import TossOrderPlan, record_paper_trade
 from .intraday import INTRADAY_DEFAULTS, evaluate_entry, session_candles, size_entry
 from .entry_watch import EntryWatch
+from .trading_hours import TIME_DEFAULTS, buy_window
 
 
-RISK_DEFAULTS = {"position_check_seconds": 30, "liquidation_minutes": 15, "buy_cutoff_minutes": 30}
+RISK_DEFAULTS = {"position_check_seconds": 30, **TIME_DEFAULTS}
 TERMINAL = {"FILLED", "CANCELED", "REJECTED", "SIMULATED_FILLED", "SIMULATED_REJECTED", "NOT_SENT"}
 
 
@@ -68,6 +70,11 @@ class BrokerBackend:
         self.local_dir, self.live, self.capital = Path(local_dir), live, capital
         self.clock = clock
 
+    @property
+    def market_cache_namespace(self):
+        client_id, _ = credentials()
+        return namespace("https://openapi.tossinvest.com", client_id)
+
     def call(self, method, *args, **kwargs):
         valid_until = kwargs.pop("_valid_until", None)
         async def invoke():
@@ -93,10 +100,13 @@ class BrokerBackend:
         return asyncio.run(fetch_quotes(list(symbols)))
 
     def entry_signal(self, symbol, start, now, settings):
-        rows = session_candles(self.call, symbol, start, now)
-        markets = {s: session_candles(self.call, s, start, now, index=True) for s in ("KOSPI", "KOSDAQ")}
-        book = self.call("get_orderbook", symbol)
-        return evaluate_entry(symbol, rows, book, markets, start, self.clock(), settings)
+        with read_budget(30):
+            key = self.market_cache_namespace
+            rows = session_candles(self.call, symbol, start, now, cache_namespace=key)
+            markets = {s: session_candles(self.call, s, start, now, index=True, cache_namespace=key)
+                       for s in ("KOSPI", "KOSDAQ")}
+            book = self.call("get_orderbook", symbol)
+            return evaluate_entry(symbol, rows, book, markets, start, self.clock(), settings)
 
     def purchase_basis(self, symbol, quantity):
         # Only full-account adoption may use the broker's aggregate purchase price.
@@ -225,13 +235,30 @@ class PositionRiskManager:
         configured_end = datetime.combine(now.date(), datetime.strptime(settings.get("market_close", "15:30"), "%H:%M").time(), KST)
         return max(start, configured_start), min(end, configured_end)
 
-    def _deadlines(self, position):
+    def _buy_window(self, now, settings, window=None):
+        window = self._window(now, settings) if window is None else window
+        if not window:
+            return None
+        regular = self._calendar(now.date())["today"]["integrated"]["regularMarket"]
+        return buy_window(window, settings, regular_open=iso_time(regular["startTime"]))
+
+    def _deadlines(self, position, settings=None):
+        settings = {**RISK_DEFAULTS, **(self.settings() if settings is None else settings)}
         acquired = date.fromisoformat(position["acquiredDate"])
         day2 = date.fromisoformat(self._calendar(acquired)["nextBusinessDay"]["date"])
         if day2 <= acquired:
             raise ValueError("Invalid next trading day")
         position["maxHoldingDate"] = day2.isoformat()
-        return day2 if position.get("carryApproved") else acquired
+        deadline_day = day2 if position.get("carryApproved") else acquired
+        regular = self._calendar(deadline_day)["today"]["integrated"]["regularMarket"]
+        start, end = iso_time(regular["startTime"]), iso_time(regular["endTime"])
+        configured_end = datetime.combine(deadline_day, datetime.strptime(settings.get("market_close", "15:30"), "%H:%M").time(), KST)
+        deadline = min(end, configured_end)
+        if position.get("carryApproved"):
+            deadline = min(deadline, start + timedelta(minutes=min(60, int(settings["carry_exit_minutes"]))))
+        due = max(start, deadline - timedelta(minutes=int(settings["liquidation_minutes"])))
+        position.update(liquidationStartsAt=due.isoformat(), liquidationDeadlineAt=deadline.isoformat())
+        return due
 
     def _import(self, state):
         if self.live and state.get("historyImported"):
@@ -349,13 +376,15 @@ class PositionRiskManager:
         # A cancel acknowledgement is not proof that remaining shares did not fill.
         self.store.save(state)
 
-    def _submit(self, state, payload, reason, experience_id=None, entry_stop=None, entry_valid_until=None, entry_watch_id=None):
+    def _submit(self, state, payload, reason, experience_id=None, entry_stop=None, entry_valid_until=None, entry_watch_id=None, strategy_context=None):
         from tradingagents.monitoring.control import RunStopped
         key = payload["clientOrderId"]
         record = {"payload": payload, "status": "SUBMITTING", "createdAt": self.clock().isoformat(),
                   "reason": reason, "experienceRunId": experience_id, "appliedQty": "0", "appliedCash": "0"}
         if entry_stop is not None:
             record["entryStopPrice"] = entry_stop
+        if strategy_context is not None:
+            record["strategyContext"] = strategy_context
         if not self.live:
             record["orderId"] = key
         state["orders"][key] = record
@@ -366,11 +395,11 @@ class PositionRiskManager:
             window = self._window(self.clock(), settings)
             if not window:
                 raise OrderWindowClosed("정규장 주문 시간이 아닙니다.")
-            deadline = window[1] - timedelta(minutes=int(settings["buy_cutoff_minutes"])) if payload["side"] == "BUY" else window[1]
+            start, deadline = self._buy_window(self.clock(), settings, window) if payload["side"] == "BUY" else window
             if entry_valid_until:
                 deadline = min(deadline, entry_valid_until)
-            if not window[0] <= self.clock() < deadline:
-                raise OrderWindowClosed("주문 제한 시간이 지났습니다.")
+            if not start <= self.clock() < deadline:
+                raise OrderWindowClosed("매수 가능 시간 또는 정규장 주문 시간 밖입니다.")
             if entry_watch_id and not self.entry_watch.valid(state, payload["symbol"], entry_watch_id):
                 raise OrderWindowClosed("후보 감시가 취소되거나 변경되어 주문하지 않았습니다.")
             response = self.backend.submit(payload, self.clock(), valid_until=deadline)
@@ -531,14 +560,18 @@ class PositionRiskManager:
         state.update(checkedAt=now.isoformat(), marketOpen=bool(window and window[0] <= now < window[1]), error=None)
         state["unconfirmed"] = [o["payload"]["clientOrderId"] for o in self._pending(state) if not o.get("orderId")]
         if not state["marketOpen"]:
+            for position in state["positions"].values():
+                if number(position["quantity"]) > 0:
+                    self._deadlines(position, settings)
+                    position["deadlineExceeded"] = now >= iso_time(position["liquidationDeadlineAt"])
             self.store.save(state)
             return
         held = self.backend.holdings()
         state["unmanaged"] = {s: str(q - number(state["positions"].get(s, {}).get("quantity", 0))) for s, q in held.items()
                               if q > number(state["positions"].get(s, {}).get("quantity", 0))}
         close = window[1] - timedelta(minutes=int(settings["liquidation_minutes"]))
-        cutoff = window[1] - timedelta(minutes=int(settings["buy_cutoff_minutes"]))
-        state.update(liquidationAt=close.isoformat(), buyCutoffAt=cutoff.isoformat())
+        buy_start, cutoff = self._buy_window(now, settings, window)
+        state.update(liquidationAt=close.isoformat(), buyStartAt=buy_start.isoformat(), buyCutoffAt=cutoff.isoformat())
         symbols = [s for s, p in state["positions"].items() if number(p["quantity"]) > 0]
         prices = {}
         try:
@@ -558,17 +591,18 @@ class PositionRiskManager:
         for order in self._pending(state):
             age = (now - iso_time(order["createdAt"])).total_seconds()
             position = state["positions"].get(order["payload"]["symbol"], {})
-            if orders and ((order["payload"]["side"] == "BUY" and (now >= cutoff or day.get("lossLimitReached") or day.get("stopLimitReached") or position.get("liquidate") or age >= 90)) or
+            if orders and ((order["payload"]["side"] == "BUY" and (now < buy_start or now >= cutoff or day.get("lossLimitReached") or day.get("stopLimitReached") or position.get("liquidate") or age >= 90)) or
                            (order["payload"]["side"] == "SELL" and age >= 90)):
                 self._cancel(state, order)
         for symbol in symbols:
             p = state["positions"][symbol]
-            deadline = self._deadlines(p)
+            due = self._deadlines(p, settings)
             reason = self._price_exit(state, p, prices, self.clock(), settings) if held.get(symbol, 0) >= number(p["quantity"]) else None
             if day.get("lossLimitReached"):
                 reason = "daily-loss-limit"
-            if now.date() > deadline or (now.date() == deadline and now >= close):
+            if now >= due:
                 reason = reason or "holding-deadline"
+            p["deadlineExceeded"] = self.clock() >= iso_time(p["liquidationDeadlineAt"])
             if reason and not p["liquidate"]:
                 p["liquidate"] = True
                 p["exitReason"] = reason
@@ -628,22 +662,33 @@ class PositionRiskManager:
         import re
         from tradingagents.monitoring.control import checkpoint
         signal, signal_error, signal_settings = None, None, None
+        learning_context = None
         signal_diagnostics = None
+        signal_rate_limit = None
         if plan.action == "BUY":
             # Slow chart reads must not hold the position ledger lock and delay exits.
             try:
                 settings = {**RISK_DEFAULTS, **INTRADAY_DEFAULTS, **self.settings()}
                 now = self.clock()
                 window = self._window(now, settings)
-                if window and window[0] <= now < window[1] - timedelta(minutes=int(settings["buy_cutoff_minutes"])):
+                entry_window = self._buy_window(now, settings, window) if window else None
+                if entry_window and entry_window[0] <= self.clock() < entry_window[1]:
                     regular_start = iso_time(self._calendar(now.date())["today"]["integrated"]["regularMarket"]["startTime"])
                     signal_settings = {k: settings[k] for k in INTRADAY_DEFAULTS}
-                    signal = self.backend.entry_signal(plan.symbol, regular_start, now, settings)
+                    cutoff = entry_window[1]
+                    with read_budget(min(30, (cutoff - self.clock()).total_seconds())):
+                        check_read_deadline()
+                        signal = self.backend.entry_signal(plan.symbol, regular_start, now, settings)
                 else:
                     signal_error = "정규장 매수 시간 밖"
             except Exception as exc:
                 signal_error = str(exc)
                 signal_diagnostics = getattr(exc, "diagnostics", None)
+                signal_rate_limit = getattr(exc, "rate_limit", None)
+                if getattr(exc, "status_code", None) == 429:
+                    signal_error = "Toss API 요청 제한으로 매수 검사 미평가; 신규 매수 보류"
+                    if signal_rate_limit and signal_rate_limit.get("retryAt"):
+                        signal_error += f" · 재시도 가능 시각: {signal_rate_limit['retryAt']}"
         with self.store.locked():
             state = self.store.load()
             if entry_watch_id and not self.entry_watch.valid(state, plan.symbol, entry_watch_id):
@@ -666,7 +711,7 @@ class PositionRiskManager:
                 raise ValueError("계좌에 같은 종목의 진행 중 주문이 있습니다.")
             position = state["positions"].get(symbol, {})
             if plan.action == "BUY":
-                if now >= iso_time(state["buyCutoffAt"]) or day.get("lossLimitReached") or day.get("stopLimitReached") or state.get("valuationError"):
+                if not iso_time(state["buyStartAt"]) <= now < iso_time(state["buyCutoffAt"]) or day.get("lossLimitReached") or day.get("stopLimitReached") or state.get("valuationError"):
                     raise ValueError("매수 제한 시간, 일일 손실 제한 또는 평가자료 부족으로 신규 매수를 차단했습니다.")
                 if number(position.get("quantity", 0)) > 0:
                     raise ValueError("보유 종목 추가 매수 금지")
@@ -684,7 +729,16 @@ class PositionRiskManager:
                         raise ValueError("; ".join(signal["reasons"]))
                     if signal["symbol"] != symbol or not 0 <= (self.clock() - iso_time(signal["at"])).total_seconds() <= 30:
                         raise ValueError("진입 신호 유효기간 초과")
-                    qty = size_entry(plan, signal, {**settings, **self._remaining_limits(state, settings)})
+                    from tradingagents.research.postmarket import sizing_adjustment, strategy_context
+                    adjustment = sizing_adjustment(self.local_dir, "live" if self.live else "dry-run",
+                                                   self.store.path.stem, self.clock(), settings)
+                    multiplier = number(adjustment["multiplier"])
+                    sizing = {**settings, **self._remaining_limits(state, settings),
+                              "position_pct": str(number(settings.get("position_pct", ".10")) * multiplier),
+                              "trade_risk_fraction": str(number(settings["trade_risk_fraction"]) * multiplier)}
+                    qty = size_entry(plan, signal, sizing)
+                    signal["postmarketSizing"] = adjustment
+                    learning_context = {**strategy_context(settings), "sizingAdjustment": adjustment}
                     if not self.live:
                         qty = min(qty, self.backend.affordable_quantity(signal["ask"]))
                     if qty <= 0:
@@ -698,6 +752,8 @@ class PositionRiskManager:
                                 state["entryChecks"][symbol][key] = signal[key]
                     if signal_diagnostics:
                         state["entryChecks"][symbol]["dataDiagnostics"] = signal_diagnostics
+                    if signal_rate_limit:
+                        state["entryChecks"][symbol]["rateLimit"] = signal_rate_limit
                     self.store.save(state)
                     return {"ok": True, "executed": False, "dryRun": not self.live, "plan": plan.__dict__,
                             "skipped": "intraday-filter", "entryCheck": state["entryChecks"][symbol]}
@@ -717,7 +773,7 @@ class PositionRiskManager:
             payload.update(clientOrderId="ta-run-" + uuid.uuid4().hex[:24], symbol=symbol, side=plan.action, orderType="LIMIT" if plan.action == "BUY" else "MARKET", timeInForce="DAY")
             # Network reads above may cross the end of the regular session.
             window = self._window(self.clock(), {**RISK_DEFAULTS, **self.settings()})
-            if not window or not window[0] <= self.clock() < window[1] or (plan.action == "BUY" and self.clock() >= iso_time(state["buyCutoffAt"])):
+            if not window or not window[0] <= self.clock() < window[1] or (plan.action == "BUY" and not iso_time(state["buyStartAt"]) <= self.clock() < iso_time(state["buyCutoffAt"])):
                 raise ValueError("Order window closed during validation")
             checkpoint("order-submitting")
             if entry_watch_id and not self.entry_watch.valid(state, symbol, entry_watch_id):
@@ -726,7 +782,7 @@ class PositionRiskManager:
             order = self._submit(state, payload, "agent-decision", experience_id,
                                  entry_stop=signal["stopPrice"] if plan.action == "BUY" else None,
                                  entry_valid_until=iso_time(signal["at"]) + timedelta(seconds=30) if plan.action == "BUY" else None,
-                                 entry_watch_id=entry_watch_id)
+                                 entry_watch_id=entry_watch_id, strategy_context=learning_context)
             self._reconcile(state)
             self.store.save(state)
             order = state["orders"][payload["clientOrderId"]]
@@ -758,6 +814,7 @@ class PositionRiskManager:
                 if self.clock() >= window[1] - timedelta(minutes=int(self.settings().get("liquidation_minutes", 15))):
                     raise ValueError("거래일 확인 중 이월 승인 시간이 종료되었습니다.")
             p["carryApproved"] = allowed
+            self._deadlines(p)
             self._event(state, "carry-setting", symbol=symbol, allowed=allowed, cycle=cycle)
             self.store.save(state)
 
@@ -798,6 +855,29 @@ class PositionRiskManager:
                 state["days"][now.date().isoformat()]["partial"] = True
             self._event(state, "legacy-holding-adopted", symbol=symbol, quantity=str(qty), acquiredDate=acquired.isoformat(), costBasis="adoption-mark-not-purchase-cost")
             self.store.save(state)
+
+    def candidate_exclusions(self, symbols):
+        """Read-only shortlist gate. Execution still rechecks the live account."""
+        with self.store.locked():
+            state = self.store.load()
+        with read_budget(20):
+            held = self.backend.holdings()
+        day = self.clock().date()
+        daily = state.get("days", {}).get(day.isoformat(), {})
+        excluded = {}
+        for symbol in symbols:
+            position = state.get("positions", {}).get(symbol, {})
+            if state.get("unconfirmed"):
+                excluded[symbol] = "미확인 주문 확인 필요"
+            elif daily.get("lossLimitReached") or daily.get("stopLimitReached"):
+                excluded[symbol] = "당일 손실/연속 손절 한도 도달"
+            elif number(held.get(symbol, 0)) > 0 or number(position.get("quantity", 0)) > 0:
+                excluded[symbol] = "보유 종목 추가 매수 금지"
+            elif self._pending(state, symbol):
+                excluded[symbol] = "기존 주문 확인 전 신규 주문 차단"
+            elif position.get("closedAt") and iso_time(position["closedAt"]).date() == day:
+                excluded[symbol] = "당일 청산 종목 재진입 금지"
+        return excluded
 
     def snapshot(self):
         with self.store.locked():

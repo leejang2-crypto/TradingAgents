@@ -86,6 +86,9 @@ def test_saved_goal_is_not_replaced_with_current_defaults():
     policy = saved_objective({'tradingObjective': objective})
     assert policy['targetPercent'] == '1.5' and policy['sameDay']
     assert any('15:15' in line for line in policy['lines'])
+    assert any('개장 후 60분 이내' in line for line in policy['lines'])
+    objective.pop('carry_exit_minutes')
+    policy = saved_objective({'tradingObjective': objective})
     assert any('최대 2거래일' in line for line in policy['lines'])
     objective.pop('liquidation_start')
     policy = saved_objective({'tradingObjective': objective})

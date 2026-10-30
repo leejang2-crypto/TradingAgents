@@ -15,7 +15,7 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
 fi
 
 print -r -- "TradingAgents: DRY RUN (simulated account; no real Toss orders)"
-print -r -- "09:20 and 13:00 analysis; holdings monitored from market open. Default: hybrid LLMs."
+print -r -- "Default: hourly analysis from 10:00; BUY before 14:30. Same-day exits; approved carry exits by next-session 10:00. Saved web settings apply."
 print -r -- "Dashboard URL will appear below."
 print -r -- "Press Ctrl+C to stop. Keep this Terminal window open."
 

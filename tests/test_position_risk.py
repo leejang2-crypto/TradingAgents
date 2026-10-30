@@ -189,6 +189,38 @@ def test_candle_diagnostics_are_saved_without_sending_orders(env):
     assert manager.snapshot()['entryChecks']['005930']['dataDiagnostics']['missingCount'] > 0
 
 
+def test_final_entry_rate_limit_is_recorded_without_order(env):
+    from tradingagents.brokers.toss_client import TossApiError
+    manager, broker, _, _ = env
+    error = TossApiError(429, 'synthetic limit')
+    error.rate_limit = {'retryAt': '2026-09-15T01:01:00+00:00', 'attempts': 3}
+    def limited(*args):
+        raise error
+    broker.entry_signal = limited
+    result = buy(manager)
+    assert not broker.orders and result['skipped'] == 'intraday-filter'
+    saved = manager.snapshot()['entryChecks']['005930']
+    assert saved['rateLimit'] == error.rate_limit
+    assert '미평가' in saved['reasons'][0]
+
+
+def test_slow_calendar_cannot_extend_entry_read_deadline_past_cutoff(env):
+    from unittest.mock import Mock
+    manager, broker, clock, _ = env
+    clock[0] = clock[0].replace(hour=14, minute=29, second=59)
+    original = manager._window
+    def slow_window(now, settings):
+        result = original(now, settings)
+        clock[0] = clock[0].replace(hour=14, minute=30, second=1)
+        return result
+    manager._window = slow_window
+    broker.entry_signal = Mock(side_effect=AssertionError('entry reads after cutoff'))
+    with pytest.raises(ValueError, match='매수 제한'):
+        buy(manager)
+    broker.entry_signal.assert_not_called()
+    assert not broker.orders
+
+
 @pytest.mark.parametrize('allowed', [False, True])
 def test_index_opening_warning_survives_final_entry_decision(env, allowed):
     manager, broker, _, _ = env
@@ -335,7 +367,7 @@ def test_carry_is_explicit_and_expires_on_second_trading_day(env):
         manager.carry("005930", p["cycle"], True)
     with pytest.raises(ValueError, match="추가 매수"):
         buy(manager)
-    time[0] = time[0].replace(hour=15, minute=15)
+    time[0] = time[0].replace(hour=10, minute=0)
     manager.tick()
     assert broker.orders["broker-2"]["side"] == "SELL"
 
