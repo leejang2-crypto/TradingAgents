@@ -71,7 +71,7 @@ def collect_technical(backend, ticker, trade_date, settings):
             signal["reasons"].append("종목당 예산으로 1주 매수 불가")
             signal["allowed"] = False
     return {"version": VERSION, "ticker": ticker, "date": trade_date,
-            "start": start.isoformat(), "asOf": evaluated_at.isoformat(), "signal": signal,
+            "start": start.isoformat(), "end": end.isoformat(), "asOf": evaluated_at.isoformat(), "signal": signal,
             "candles": rows, "markets": markets, "orderbook": book, "settings": deepcopy(settings)}
 
 

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 import main
+from tests.test_twice_daily_schedule import clock as clock
 from unittest.mock import Mock
 from tradingagents.monitoring import auth
 from tradingagents.monitoring.control import RunController
@@ -214,7 +215,10 @@ def test_manual_endpoints_auth_and_busy_resolution(server, monkeypatch):
     assert server.control.paused
     monkeypatch.setattr(main, "is_regular_market_open", lambda *a, **kw: False)
     command.update(requestId="3" * 32, action="trade")
-    assert request(server, "POST", "/api/control/run", command, cookie=cookie)[0] == 400
+    original = server.control.snapshot()
+    status, _, body = request(server, "POST", "/api/control/run", command, cookie=cookie)
+    assert status == 200 and json.loads(body)["skipped"] == "entry-window"
+    assert server.control.snapshot() == original
 
 
 def test_position_management_writes_use_login_and_csrf_guard(server):
@@ -261,7 +265,8 @@ def test_settings_and_pause_cancel_waiting_entries(server):
 
 
 @pytest.mark.parametrize('live', [False, True])
-def test_auto_run_uses_saved_settings_auth_market_guard_and_live_confirmation(server, monkeypatch, live):
+def test_auto_run_uses_saved_settings_auth_market_guard_and_live_confirmation(clock, server, monkeypatch, live):
+    clock.current = clock.current.replace(hour=10)
     server.control = RunController(live=live)
     payload = {'action': 'trade', 'requestId': 'a' * 32}
     monkeypatch.setattr(main, 'is_regular_market_open', lambda *args, **kwargs: True)
@@ -274,7 +279,7 @@ def test_auto_run_uses_saved_settings_auth_market_guard_and_live_confirmation(se
         assert server.control.pending is None
         payload['confirmLive'] = True
     monkeypatch.setattr(main, 'is_regular_market_open', lambda *args, **kwargs: False)
-    assert request(server, 'POST', '/api/control/run', payload, cookie=cookie)[0] == 400
+    assert request(server, 'POST', '/api/control/run', payload, cookie=cookie)[0] == 200
     assert server.control.pending is None
     monkeypatch.setattr(main, 'is_regular_market_open', lambda *args, **kwargs: True)
     assert request(server, 'POST', '/api/control/run', payload, cookie=cookie)[0] == 202

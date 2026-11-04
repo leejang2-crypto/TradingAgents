@@ -5,7 +5,7 @@ holdings are observed but never silently adopted. Unknown submissions are not re
 """
 
 import asyncio
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -524,6 +524,22 @@ class PositionRiskManager:
             position.update(lastPrice=None, returnPct=None, estimatedNetReturnPct=None)
         return None
 
+    def change_paper_costs(self, rates, revision, *, control=None):
+        if self.live:
+            raise ValueError("실투자 비용은 이 화면에서 변경할 수 없습니다.")
+        # Match the entry watcher: risk lock first, then the controller lock.
+        with self.store.locked(), (control.lock if control else nullcontext()):
+            if control:
+                execution = control.snapshot()
+                if not execution["paused"] or execution["active"] or execution["pending"]:
+                    raise ValueError("자동 분석을 일시정지하고 진행 작업 완료 후 비용을 적용하세요.")
+            state = self.store.load()
+            if state.get("unconfirmed") or self._pending(state):
+                raise ValueError("진행 중이거나 미확인인 주문이 있습니다.")
+            if any(number(p.get("quantity", 0)) > 0 for p in state.get("positions", {}).values()):
+                raise ValueError("보유 종목 청산 후 비용을 변경하세요.")
+            return paper_account(self.local_dir, self.settings().get("paper_capital", "10000000")).change_costs(rates, revision)
+
     def _remaining_limits(self, state, settings):
         capital = number(settings.get("paper_capital", "10000000"))
         cost_rate = number(settings["estimated_cost_rate"])
@@ -732,13 +748,20 @@ class PositionRiskManager:
                     from tradingagents.research.postmarket import sizing_adjustment, strategy_context
                     adjustment = sizing_adjustment(self.local_dir, "live" if self.live else "dry-run",
                                                    self.store.path.stem, self.clock(), settings)
-                    multiplier = number(adjustment["multiplier"])
+                    from tradingagents.research.weekly_review import sizing_adjustment as weekly_sizing, settings_key as weekly_settings_key
+                    weekly_adjustment = weekly_sizing(self.local_dir, "live" if self.live else "dry-run",
+                                                     self.store.path.stem, self.clock(), settings)
+                    # Two defensive policies must not compound reductions or loosen exits.
+                    multiplier = min(number(adjustment["multiplier"]), number(weekly_adjustment["multiplier"]))
                     sizing = {**settings, **self._remaining_limits(state, settings),
                               "position_pct": str(number(settings.get("position_pct", ".10")) * multiplier),
                               "trade_risk_fraction": str(number(settings["trade_risk_fraction"]) * multiplier)}
                     qty = size_entry(plan, signal, sizing)
                     signal["postmarketSizing"] = adjustment
-                    learning_context = {**strategy_context(settings), "sizingAdjustment": adjustment}
+                    signal["weeklySizing"] = weekly_adjustment
+                    learning_context = {**strategy_context(settings), "sizingAdjustment": adjustment,
+                                        "weeklySettingsKey": weekly_settings_key(settings),
+                                        "weeklySizingAdjustment": weekly_adjustment}
                     if not self.live:
                         qty = min(qty, self.backend.affordable_quantity(signal["ask"]))
                     if qty <= 0:

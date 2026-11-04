@@ -8,7 +8,7 @@ import pandas as pd
 from .intraday import INTRADAY_DEFAULTS, bars, session_candles, stamp, market_reference, relative_volume
 from .paper_account import now_kst
 from .toss_transport import read_budget
-from .trading_hours import buy_window
+from .trading_hours import buy_window, entry_window_state
 from tradingagents.monitoring.control import checkpoint, RunStopped
 
 
@@ -79,20 +79,36 @@ def screen_candidates(candidates, backend, settings, *, requested_date, clock=no
             raise TimeoutError("후보 시장자료 수집 제한시간 초과")
         return value
 
+    def time_blocked(gate):
+        result.update(status="time-blocked", notice=gate["notice"], entryWindow=gate,
+                      evaluatedCount=0, unavailableCount=0, rateLimitedCount=0, timeBlockedCount=len(candidates))
+        result["marketGate"] = {"status": "not-evaluated", "index": "KOSPI", "reason": "entry-window"}
+        result["rows"] = [{**row, "intraday": {"eligible": False, "watchable": False, "state": "EXCLUDED",
+            "score": None, "assessment": "time-blocked", "reasonCode": "entry-window", "reasons": [gate["notice"]]}}
+            for row in candidates]
+        return result
+
     try:
         if requested_date != now.date().isoformat():
             raise ValueError("당일 후보 재평가는 오늘 날짜만 지원합니다.")
         calendar = checked_call("get_kr_calendar", requested_date)
         if calendar["today"]["date"] != requested_date:
             raise ValueError("거래일 자료 날짜 불일치")
-        session = calendar["today"]["integrated"]["regularMarket"]
+        session = (calendar["today"]["integrated"] or {}).get("regularMarket")
+        holidays = {day.strip() for day in settings.get("holiday_dates", "").split(",")}
+        if session is None or requested_date in holidays:
+            return time_blocked(entry_window_state(clock(), None))
         start, end = stamp(session["startTime"]), stamp(session["endTime"])
+        if end <= start:
+            raise ValueError("거래일 자료의 정규장 시간이 유효하지 않습니다.")
         configured_open = datetime.combine(now.date(), datetime.strptime(settings.get("market_open", "09:00"), "%H:%M").time(), now.tzinfo)
         configured_close = datetime.combine(now.date(), datetime.strptime(settings.get("market_close", "15:30"), "%H:%M").time(), now.tzinfo)
         entry_start, cutoff = buy_window((max(start, configured_open), min(end, configured_close)), settings, regular_open=start)
-        holidays = {day.strip() for day in settings.get("holiday_dates", "").split(",")}
-        if requested_date in holidays or start.date() != now.date() or end.date() != now.date() or not entry_start <= now < cutoff:
-            raise ValueError("정규장 신규 매수 가능 시간 밖")
+        if start.date() != now.date() or end.date() != now.date():
+            raise ValueError("거래일 자료 날짜 불일치")
+        gate = entry_window_state(clock(), (entry_start, cutoff))
+        if not gate["allowed"]:
+            return time_blocked(gate)
         deadline = min(deadline, cutoff)
         # Every candidate uses the same completed candle boundary and KOSPI baseline.
         market_data = result.setdefault("marketData", {})

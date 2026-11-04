@@ -7,6 +7,7 @@ import pytest
 from langchain_core.runnables import RunnableLambda
 
 import main
+from tests.test_twice_daily_schedule import clock as clock
 from tradingagents.monitoring.control import (
     BusyError, RunController, RunStopped, cancellation_callbacks, checkpoint, scheduled_job,
 )
@@ -167,7 +168,9 @@ def test_trade_rechecks_market_after_queueing(args, monkeypatch):
     trading = AsyncMock()
     monkeypatch.setattr(main, "run_auto_trading", trading)
     asyncio.run(main.run_manual_job(args, control, job))
-    assert control.last["status"] == "failed"
+    assert control.last["status"] == "skipped"
+    assert control.last["result"]["skipped"] == "entry-window"
+    assert not main.scheduler_state_path().exists()
     trading.assert_not_called()
 
 
@@ -191,7 +194,8 @@ def test_daily_scheduler_consumes_manual_queue_while_paused(args, monkeypatch):
     assert not main.has_scheduler_completed(args.date)
 
 
-def test_manual_trade_reserves_current_slot(args, monkeypatch):
+def test_manual_trade_reserves_current_slot(clock, args, monkeypatch):
+    clock.current = clock.current.replace(hour=10)
     control = RunController()
     job = start_manual(control, args, action="trade")
     monkeypatch.setattr(main, "is_regular_market_open", lambda *a, **kw: True)
@@ -203,7 +207,8 @@ def test_manual_trade_reserves_current_slot(args, monkeypatch):
     assert trading.call_args.kwargs["execute"] is False
 
 
-def test_manual_market_veto_is_completed_not_completed_with_errors(args, monkeypatch):
+def test_manual_market_veto_is_completed_not_completed_with_errors(clock, args, monkeypatch):
+    clock.current = clock.current.replace(hour=10)
     control = RunController()
     job = start_manual(control, args, action="trade")
     monkeypatch.setattr(main, "is_regular_market_open", lambda *a, **kw: True)

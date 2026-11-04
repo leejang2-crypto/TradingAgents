@@ -7,10 +7,12 @@ import pytest
 import main
 from tradingagents.brokers import toss_executor
 from tests.test_long_term_research import universe_snapshot
+from tests.test_twice_daily_schedule import clock as clock
 
 
 @pytest.fixture
-def live_args(monkeypatch, tmp_path):
+def live_args(clock, monkeypatch, tmp_path):
+    clock.current = clock.current.replace(hour=10)
     monkeypatch.setattr(main, "LOCAL_DIR", tmp_path)
     monkeypatch.setattr(main, "is_regular_market_open", lambda *a, **kw: True)
     return main.make_parser().parse_args(["--scenario", "auto-live", "--yes", "--run-mode", "once"])
@@ -54,8 +56,8 @@ def test_live_requires_authorization_before_pipeline(live_args, monkeypatch):
 
 def test_live_once_rejects_closed_market_before_reserving_date(live_args, monkeypatch):
     monkeypatch.setattr(main, "is_regular_market_open", lambda *a, **kw: False)
-    with pytest.raises(ValueError, match="regular session"):
-        asyncio.run(main.run_auto_live(live_args))
+    result = asyncio.run(main.run_auto_live(live_args))
+    assert result['ok'] and result['skipped'] == 'entry-window'
     assert not main.scheduler_state_path("auto-live").exists()
 
 

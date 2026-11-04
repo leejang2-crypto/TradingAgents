@@ -49,15 +49,17 @@ from tradingagents.llm_clients.credit_fallback import run_with_credit_fallback
 from tradingagents.monitoring.auth import DashboardAuth, LoginError
 from tradingagents.monitoring.summary import LocalSummaryService, with_report_evidence
 from tradingagents.monitoring.control import BusyError, RunController, RunStopped, checkpoint, scheduled_job
+from tradingagents.monitoring.scheduler_recovery import recoverable_paper_slots
 from tradingagents.monitoring.telegram import TelegramNotifier, DEFAULTS as TELEGRAM_DEFAULTS, CATEGORIES as TELEGRAM_CATEGORIES, notify, analysis_notification
 from tradingagents.brokers.position_risk import PositionRiskManager, RISK_DEFAULTS, BrokerBackend
-from tradingagents.brokers.trading_hours import TIME_DEFAULTS, TIME_LIMITS, buy_window, scan_start
+from tradingagents.brokers.trading_hours import TIME_DEFAULTS, TIME_LIMITS, buy_window, scan_start, entry_window_state
+from tradingagents.brokers.toss_transport import read_budget
 from tradingagents.brokers.candidate_screen import screen_candidates
 from tradingagents.brokers.intraday import INTRADAY_DEFAULTS, DECIMAL_LIMITS, INTEGER_LIMITS, ENTRY_STRATEGIES
 from tradingagents.brokers.intraday_analysis import collect_technical, news_material, review_news, build_state, IntradayReport
 from tradingagents.research.service import ResearchBusy, ResearchService
 from tradingagents.research.universe import UniverseError, validate_snapshot as validate_universe
-from tradingagents.research import postmarket
+from tradingagents.research import postmarket, weekly_review, strategy_comparison
 from tradingagents.research import candidate_review
 
 
@@ -79,6 +81,8 @@ SETTINGS_LOCK = threading.RLock()
 SETTING_KEYS = {
     *TELEGRAM_DEFAULTS,
     *postmarket.DEFAULTS,
+    *weekly_review.DEFAULTS,
+    *strategy_comparison.DEFAULTS,
     "intraday_engine",
     "paper_capital",
     "position_pct",
@@ -110,7 +114,7 @@ def make_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--intraday-engine", choices=["rules-news", "multi-agent"], default="rules-news",
                         help="Hourly candidate analysis: 5-minute chart rules + news review, or multi-agent analysis.")
-    for key, value in {**postmarket.DEFAULTS, **TELEGRAM_DEFAULTS}.items():
+    for key, value in {**postmarket.DEFAULTS, **weekly_review.DEFAULTS, **strategy_comparison.DEFAULTS, **TELEGRAM_DEFAULTS}.items():
         parser.add_argument("--" + key.replace("_", "-"), action=argparse.BooleanOptionalAction, default=value)
     parser.add_argument(
         "--scenario",
@@ -450,6 +454,33 @@ def mark_scheduler_completed(run_date: str, summary_path: str | None, status: st
     atomic_write_json(path, state)
 
 
+def recover_premature_paper_slots(args):
+    """Called only at startup while holding the scheduler's exclusive process lock."""
+    if args.scenario != "auto-paper":
+        return []
+    run_date = today_korea().isoformat()
+    state = load_scheduler_state("auto-paper")
+    slots = recoverable_paper_slots(LOCAL_DIR, state, run_date)
+    if not slots:
+        return []
+    backup = LOCAL_DIR / "scheduler" / "recovery" / f"premature_{datetime.now(KOREA_TZ):%Y%m%d_%H%M%S_%f}.json"
+    atomic_write_json(backup, {"reason": "before-entry-no-orders", "date": run_date, "slots": slots, "state": state})
+    record = state["runs"][run_date]
+    for slot in slots:
+        del record["slots"][slot]
+    if not record["slots"]:
+        del state["runs"][run_date]
+        state["completedDates"] = [value for value in state["completedDates"] if value != run_date]
+    elif record.get("lastSlot") in slots:
+        for key in ("status", "startedAt", "completedAt", "summaryPath", "lastSlot"):
+            record.pop(key, None)
+        last = max(record["slots"], key=lambda key: record["slots"][key].get("startedAt", ""))
+        record.update(record["slots"][last], lastSlot=last)
+    atomic_write_json(scheduler_state_path("auto-paper"), state)
+    print(json.dumps({"status": "recovered-premature-paper-slots", "slots": slots, "backup": str(backup)}, ensure_ascii=False), flush=True)
+    return slots
+
+
 def has_scheduler_completed(run_date: str, scenario: str = "auto-paper", slot: str | None = None) -> bool:
     state = load_scheduler_state(scenario)
     slots = state.get("runs", {}).get(run_date, {}).get("slots", {})
@@ -494,6 +525,20 @@ def scheduled_entry_window(now: datetime, args):
     return buy_window(window, default_settings(args))
 
 
+def manual_entry_gate(settings, risk=None):
+    now = datetime.now(KOREA_TZ)
+    opened, closed = settings.get("market_open", DEFAULT_MARKET_OPEN), settings.get("market_close", DEFAULT_MARKET_CLOSE)
+    if not is_regular_market_open(now, open_text=opened, close_text=closed,
+                                  holidays=holiday_dates(settings.get("holiday_dates", ""))):
+        return entry_window_state(now, None)
+    if isinstance(risk, PositionRiskManager):
+        with read_budget(5):
+            window = risk._buy_window(now, settings)
+    else:
+        window = buy_window(market_window_for(now.date(), opened, closed), settings)
+    return entry_window_state(datetime.now(KOREA_TZ), window)
+
+
 def active_trading_slot(now: datetime, args=None, entry_window=None) -> str:
     if args is not None:
         local = now.astimezone(KOREA_TZ)
@@ -519,6 +564,8 @@ def default_settings(args: argparse.Namespace) -> dict[str, Any]:
         **{key: getattr(args, key, value) for key, value in TELEGRAM_DEFAULTS.items()},
         "intraday_engine": getattr(args, "intraday_engine", "rules-news"),
         **{key: getattr(args, key, value) for key, value in postmarket.DEFAULTS.items()},
+        **{key: getattr(args, key, value) for key, value in weekly_review.DEFAULTS.items()},
+        **{key: getattr(args, key, value) for key, value in strategy_comparison.DEFAULTS.items()},
         **{key: getattr(args, key, value) for key, value in RISK_DEFAULTS.items()},
         **{key: getattr(args, key, value) for key, value in INTRADAY_DEFAULTS.items()},
         **{key: deepcopy(getattr(args, key, value)) for key, value in LLM_DEFAULTS.items()},
@@ -627,7 +674,7 @@ def validate_trading_settings(settings: dict[str, Any]) -> dict[str, Any]:
             if key == "opening_range_minutes" and int(value) % 5:
                 raise ValueError("opening_range_minutes must use 5-minute steps.")
             cleaned[key] = int(value)
-        elif key == "openai_credit_fallback" or key in postmarket.DEFAULTS or key in TELEGRAM_DEFAULTS:
+        elif key == "openai_credit_fallback" or key in postmarket.DEFAULTS or key in weekly_review.DEFAULTS or key in strategy_comparison.DEFAULTS or key in TELEGRAM_DEFAULTS:
             if not isinstance(value, bool):
                 raise ValueError(f"{key} must be a boolean.")
             cleaned[key] = value
@@ -861,10 +908,11 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
     )
     candidate_market = candidates.get("intradayScreen") or {}
     candidate_market_status = {"completed": "평가 완료", "partial": "일부 미평가", "failed": "자료/처리 오류",
-                               "market-blocked": "시장 위험으로 신규 매수 보류"}.get(
+                               "market-blocked": "시장 위험으로 신규 매수 보류",
+                               "time-blocked": "매수 시간 제한으로 생략"}.get(
                                    candidate_market.get("status"), candidate_market.get("status", "미평가"))
     settings = snapshot.get("settings") if isinstance(snapshot.get("settings"), dict) else {}
-    settings = {**LLM_DEFAULTS, **INTRADAY_DEFAULTS, **postmarket.DEFAULTS, **TELEGRAM_DEFAULTS, **settings}
+    settings = {**LLM_DEFAULTS, **INTRADAY_DEFAULTS, **postmarket.DEFAULTS, **weekly_review.DEFAULTS, **strategy_comparison.DEFAULTS, **TELEGRAM_DEFAULTS, **settings}
     telegram_controls = ''.join(
         f'<label style="display:flex;align-items:center;gap:8px"><input style="width:auto" type="checkbox" name="telegram_{key}" '
         f'{"checked" if settings["telegram_" + key] else ""}>{label}</label>' for key, label in TELEGRAM_CATEGORIES.items())
@@ -1031,6 +1079,8 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
   <script src="/assets/control.js" defer></script>
   <script src="/assets/positions.js" defer></script>
   <script src="/assets/telegram.js" defer></script>
+  <script src="/assets/weekly.js" defer></script>
+  <script src="/assets/strategy.js" defer></script>
   <style>
     :root {{ color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
     body {{ margin: 0; background: #f7f8fa; color: #1d2433; }}
@@ -1071,6 +1121,8 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
       payload.openai_credit_fallback = form.elements.openai_credit_fallback.checked;
       payload.postmarket_review = form.elements.postmarket_review.checked;
       payload.postmarket_apply = form.elements.postmarket_apply.checked;
+      payload.weekly_review = form.elements.weekly_review.checked;
+      payload.strategy_observation = form.elements.strategy_observation.checked;
       for (const key of {json.dumps(list(TELEGRAM_DEFAULTS))}) payload[key] = form.elements[key].checked;
       payload.hybrid_agent_providers = {{}};
       for (const key of Object.keys(payload)) {{
@@ -1161,11 +1213,44 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
     <button type="button" role="tab" id="tab-overview" aria-controls="view-overview" aria-selected="true" data-view="overview">현황</button>
     <button type="button" role="tab" id="tab-analysis" aria-controls="view-analysis" aria-selected="false" data-view="analysis" tabindex="-1">분석</button>
     <button type="button" role="tab" id="tab-research" aria-controls="view-research" aria-selected="false" data-view="research" tabindex="-1">중장기</button>
+    <button type="button" role="tab" id="tab-weekly" aria-controls="view-weekly" aria-selected="false" data-view="weekly" tabindex="-1">주간 복기</button>
+    <button type="button" role="tab" id="tab-strategy" aria-controls="view-strategy" aria-selected="false" data-view="strategy" tabindex="-1">전략 비교</button>
     <button type="button" role="tab" id="tab-history" aria-controls="view-history" aria-selected="false" data-view="history" tabindex="-1">거래 내역</button>
     <button type="button" role="tab" id="tab-execution" aria-controls="view-execution" aria-selected="false" data-view="execution" tabindex="-1">실행</button>
     <button type="button" role="tab" id="tab-settings" aria-controls="view-settings" aria-selected="false" data-view="settings" tabindex="-1">설정</button>
   </nav>
   <main id="dashboard-main">
+    <section id="strategy-panel">
+      <h2>단타 전략 비교</h2>
+      <div class="control-actions"><button type="button" id="strategy-run" disabled>저장 자료 비교</button></div>
+      <p id="strategy-status" role="status">실행기 연결 확인 전</p>
+      <p id="strategy-watch"></p>
+      <details><summary>비용 기준</summary>
+        <p id="strategy-paper-costs"></p>
+        <form id="strategy-cost-form"><div class="form-grid">
+          <label>편도 수수료 비율<input name="feeRate" type="number" min="0" max="0.05" step="0.00001" value="0" required></label>
+          <label>매도 세금 비율<input name="sellTaxRate" type="number" min="0" max="0.05" step="0.00001" value="0" required></label>
+          <label>편도 슬리피지 비율<input name="slippageRate" type="number" min="0" max="0.025" step="0.00001" value="0" required></label>
+          <label>비교용 왕복 총비용 하한<input name="roundTripFloor" type="number" min="0" max="0.05" step="0.0001" value="0.003" required></label>
+        </div><div class="control-actions"><button type="submit" id="strategy-cost-save">비교 비용 저장</button>
+          <button type="button" id="strategy-paper-apply" disabled>모의 계좌 비용 적용</button></div></form>
+        <p id="strategy-cost-status" role="status"></p>
+      </details>
+      <div id="strategy-result"></div>
+    </section>
+    <section id="weekly-panel">
+      <h2>주간 복기</h2>
+      <div class="auto-run-toolbar">
+        <button type="button" id="weekly-run">복기 실행</button>
+        <button type="button" id="weekly-compare" disabled>모의 비교</button>
+        <button type="button" id="weekly-summary" disabled>로컬 요약</button>
+        <button type="button" id="weekly-approve" disabled>개선안 승인</button>
+        <button type="button" id="weekly-rollback" disabled>적용 원복</button>
+      </div>
+      <p id="weekly-status" role="status">복기 기록 확인 전</p>
+      <p id="weekly-policy"></p>
+      <div id="weekly-result"></div>
+    </section>
     <section id="research-panel">
       <h2>중장기 종목 탐색</h2>
       <p class="muted">연구 전용 · 자동 주문/보유 편입 없음 · 점수는 예상 수익률이 아닙니다.</p>
@@ -1374,6 +1459,8 @@ def render_monitor_html(snapshot: dict[str, Any]) -> str:
         <label>자동 단타 분석<select name="intraday_engine">{options({"rules-news": "5분봉 규칙 + 뉴스 검토", "multi-agent": "다중 에이전트 분석"}, settings.get("intraday_engine", "rules-news"))}</select></label>
         <label><input type="checkbox" style="width:auto" name="postmarket_review" {'checked' if settings['postmarket_review'] else ''}>장 마감 자동 복기</label>
         <label><input type="checkbox" style="width:auto" name="postmarket_apply" {'checked' if settings['postmarket_apply'] else ''}>검증된 복기 결과로 신규 진입 규모 조정</label>
+        <label><input type="checkbox" style="width:auto" name="weekly_review" {'checked' if settings['weekly_review'] else ''}>휴장일 주간 자동 복기</label>
+        <label><input type="checkbox" style="width:auto" name="strategy_observation" {'checked' if settings['strategy_observation'] else ''}>선정 후보 5분 비교 관찰 (주문 없음)</label>
         <div class="form-grid">
           <label>분봉 진입 전략<select name="entry_strategy">{options(ENTRY_STRATEGIES, settings['entry_strategy'])}</select></label>
           {intraday_controls}
@@ -1492,7 +1579,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
     def _get(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path in {"/assets/account.js", "/assets/account.css", "/assets/control.js", "/assets/control.css", "/assets/login.js", "/assets/positions.js", "/assets/dashboard.js", "/assets/dashboard.css", "/assets/research.js", "/assets/telegram.js"}:
+        if parsed.path in {"/assets/account.js", "/assets/account.css", "/assets/control.js", "/assets/control.css", "/assets/login.js", "/assets/positions.js", "/assets/dashboard.js", "/assets/dashboard.css", "/assets/research.js", "/assets/telegram.js", "/assets/weekly.js", "/assets/strategy.js"}:
             name = parsed.path.rsplit("/", 1)[-1]
             payload = (PROJECT_DIR / "tradingagents" / "monitoring" / name).read_bytes()
             self.send_response(200)
@@ -1520,6 +1607,14 @@ class MonitorHandler(BaseHTTPRequestHandler):
                 self.end_headers()
             else:
                 self._send_json(401, {"ok": False, "error": "로그인이 필요합니다."})
+            return
+        if parsed.path == "/api/strategy":
+            service = getattr(self.server, "strategy", None)
+            self._send_json(200, service.snapshot() if isinstance(service, strategy_comparison.StrategyComparisonService) else {"available": False})
+            return
+        if parsed.path == "/api/weekly":
+            service = getattr(self.server, "weekly", None)
+            self._send_json(200, service.snapshot() if isinstance(service, weekly_review.WeeklyReviewService) else {"available": False})
             return
         if parsed.path == "/api/telegram":
             service = getattr(self.server, "telegram", None)
@@ -1587,7 +1682,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
     def _post(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path not in {"/api/telegram/test", "/api/positions/watch-cancel", "/api/analysis-summary/local", "/api/settings", "/api/account/refresh", "/api/login", "/api/logout", "/api/control/run", "/api/control/pause", "/api/control/cancel-pending", "/api/positions/carry", "/api/positions/adopt", "/api/research/run", "/api/research/stop", "/api/research/universe"}:
+        if parsed.path not in {"/api/strategy/run", "/api/strategy/costs", "/api/strategy/paper-costs", "/api/weekly/run", "/api/weekly/compare", "/api/weekly/summary", "/api/weekly/approve", "/api/weekly/rollback", "/api/telegram/test", "/api/positions/watch-cancel", "/api/analysis-summary/local", "/api/settings", "/api/account/refresh", "/api/login", "/api/logout", "/api/control/run", "/api/control/pause", "/api/control/cancel-pending", "/api/positions/carry", "/api/positions/adopt", "/api/research/run", "/api/research/stop", "/api/research/universe"}:
             self.send_error(404)
             return
         if parsed.path != "/api/login" and not self._authorized():
@@ -1615,6 +1710,32 @@ class MonitorHandler(BaseHTTPRequestHandler):
                 payload = {key: values[-1] for key, values in parsed_form.items()}
             if not isinstance(payload, dict):
                 raise ValueError("Settings payload must be an object.")
+            if parsed.path.startswith("/api/strategy/"):
+                service = getattr(self.server, "strategy", None)
+                if not isinstance(service, strategy_comparison.StrategyComparisonService):
+                    raise ValueError("자동 매매 실행기를 재시작하세요.")
+                if parsed.path.endswith("/paper-costs"):
+                    control, risk = getattr(self.server, "control", None), getattr(self.server, "risk", None)
+                    if payload.get("confirmed") is not True or not isinstance(control, RunController) or not isinstance(risk, PositionRiskManager):
+                        raise ValueError("모의 비용 변경 승인과 실행기가 필요합니다.")
+                    rates = strategy_comparison.cost_profile(payload.get("rates"))
+                    risk.change_paper_costs(rates, payload.get("paperRevision"), control=control)
+                    result = service.snapshot()
+                elif parsed.path.endswith("/costs"):
+                    try:
+                        result = service.save_profile(payload)
+                    except OSError:
+                        raise ValueError("External 연결과 연구 저장소 쓰기 권한을 확인하세요.") from None
+                else:
+                    result = service.submit()
+                self._send_json(202, {"ok": True, **result})
+                return
+            if parsed.path.startswith("/api/weekly/"):
+                service = getattr(self.server, "weekly", None)
+                if not isinstance(service, weekly_review.WeeklyReviewService):
+                    raise ValueError("주간 복기 실행기가 없습니다. 자동 매매 실행기를 재시작하세요.")
+                self._send_json(202, {"ok": True, **service.submit(parsed.path.rsplit("/", 1)[-1], payload)})
+                return
             if parsed.path == "/api/telegram/test":
                 service = getattr(self.server, "telegram", None)
                 queued = isinstance(service, TelegramNotifier) and service.test()
@@ -1632,6 +1753,9 @@ class MonitorHandler(BaseHTTPRequestHandler):
                         state = research.stop(payload.get("requestId"))
                     elif parsed.path.endswith("/universe"):
                         state = research.register_universe(payload)
+                        comparison = getattr(self.server, "strategy", None)
+                        if comparison:
+                            comparison.cancel()
                     else:
                         control = getattr(self.server, "control", None)
                         if isinstance(control, RunController):
@@ -1686,16 +1810,25 @@ class MonitorHandler(BaseHTTPRequestHandler):
                         state = control.cancel_pending(payload.get("requestId"))
                     else:
                         settings = load_trading_settings()
-                        if payload.get("action") == "trade" and not is_regular_market_open(
-                            datetime.now(KOREA_TZ), open_text=settings.get("market_open", DEFAULT_MARKET_OPEN),
-                            close_text=settings.get("market_close", DEFAULT_MARKET_CLOSE),
-                            holidays=holiday_dates(settings.get("holiday_dates", "")),
-                        ):
-                            raise ValueError("매매 실행은 설정된 정규장 시간에만 가능합니다.")
+                        if payload.get("action") == "trade":
+                            if control.live and payload.get("confirmLive") is not True:
+                                raise ValueError("실제 주문 실행 확인이 필요합니다.")
+                            try:
+                                gate = manual_entry_gate(settings, getattr(self.server, "risk", None))
+                            except Exception:
+                                self._send_json(503, {"ok": False, "error": "거래일·매수 가능 시간을 확인하지 못해 실행하지 않았습니다. 잠시 후 다시 확인하세요."})
+                                return
+                            if not gate["allowed"]:
+                                self._send_json(200, {"ok": True, "skipped": "entry-window", "notice": gate["notice"],
+                                                      "entryWindow": gate, "control": control.snapshot()})
+                                return
                         state = control.submit(payload, settings)
                     risk = getattr(self.server, "risk", None)
                     if isinstance(risk, PositionRiskManager) and (state.get("paused") or state.get("stopRequested")):
                         risk.entry_watch.cancel(reason="사용자 일시정지/중단")
+                    comparison = getattr(self.server, "strategy", None)
+                    if comparison and (state.get("paused") or state.get("stopRequested")):
+                        comparison.cancel()
                 except BusyError as exc:
                     self._send_json(409, {"ok": False, "error": str(exc), "control": control.snapshot()})
                     return
@@ -1713,6 +1846,9 @@ class MonitorHandler(BaseHTTPRequestHandler):
             risk = getattr(self.server, "risk", None)
             if isinstance(risk, PositionRiskManager):
                 risk.entry_watch.cancel(reason="사용자 설정 저장: 재분석 필요")
+            comparison = getattr(self.server, "strategy", None)
+            if comparison:
+                comparison.cancel()
         except (ValueError, TypeError, ArithmeticError) as exc:
             self._send_json(400, {"ok": False, "error": str(exc)})
             return
@@ -1735,7 +1871,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
         return
 
 
-def start_monitor_server(host: str, port: int, *, scenario: str = "auto-paper", control=None, risk=None, telegram=None) -> ThreadingHTTPServer:
+def start_monitor_server(host: str, port: int, *, scenario: str = "auto-paper", control=None, risk=None, telegram=None, weekly=None, strategy=None) -> ThreadingHTTPServer:
     bind_host, access_host = resolve_monitor_host(host)
     server = ThreadingHTTPServer((bind_host, port), MonitorHandler)
     server.local_summary = LocalSummaryService()
@@ -1744,6 +1880,8 @@ def start_monitor_server(host: str, port: int, *, scenario: str = "auto-paper", 
     server.control = control
     server.risk = risk
     server.telegram = telegram
+    server.weekly = weekly
+    server.strategy = strategy
     server.research = ResearchService(LOCAL_DIR / "long_term", PROJECT_DIR)
     ensure_monitor_token()
     port = server.server_address[1]
@@ -2358,9 +2496,11 @@ async def run_auto_live(args: argparse.Namespace) -> dict[str, Any]:
     if args.date and args.date != run_date:
         raise ValueError("Live trading must use today's Korean market date.")
     args.date = run_date
-    if not is_regular_market_open(datetime.now(KOREA_TZ), open_text=args.market_open, close_text=args.market_close, holidays=holiday_dates(args.holiday_dates)):
-        raise ValueError("Live trading can only execute during the configured regular session.")
-    slot = active_trading_slot(datetime.now(KOREA_TZ), args)
+    gate = await asyncio.to_thread(manual_entry_gate, default_settings(args), getattr(args, "_position_manager", None))
+    if not gate["allowed"]:
+        return {"ok": True, "skipped": "entry-window", "selectionReason": gate["notice"], "entryWindow": gate}
+    window = (datetime.fromisoformat(gate["startsAt"]), datetime.fromisoformat(gate["cutoffAt"]))
+    slot = active_trading_slot(datetime.now(KOREA_TZ), args, window)
     requested_slot = getattr(args, "_schedule_slot", None)
     if args.run_mode == "daily-market" and requested_slot is not None and requested_slot != slot:
         raise ValueError("Scheduled trading slot is no longer current.")
@@ -2369,7 +2509,8 @@ async def run_auto_live(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("A live run was already started in this time slot; automatic replay is disabled.")
     mark_live_run_started(run_date, slot)
     summary = await run_auto_trading(args, execute=True)
-    mark_scheduler_completed(run_date, summary.get("summaryPath"), "completed" if summary["ok"] else "completed-with-errors", scenario="auto-live", slot=slot)
+    status = "completed-with-errors" if not summary["ok"] else "skipped" if summary.get("skipped") == "entry-window" else "completed"
+    mark_scheduler_completed(run_date, summary.get("summaryPath"), status, scenario="auto-live", slot=slot)
     return summary
 
 
@@ -2470,6 +2611,9 @@ async def run_auto_trading(args: argparse.Namespace, *, execute: bool) -> dict[s
                       or (uses_intraday_rules(args) and row["intraday"].get("watchable"))] if selection_ok else []
     candidate_names = {row["ticker"]: row.get("name") for row in candidates}
     tickers = [row["ticker"] for row in candidates[: max(args.trade_candidates, 0)]]
+    comparison = getattr(args, "_strategy", None)
+    if comparison:
+        comparison.register(tickers, candidate_snapshot.get("universe") or {}, default_settings(args))
     if not tickers and not selection_reason:
         selection_reason = "분석 종목 수가 0으로 설정됨" if args.trade_candidates == 0 else "코스피200 뉴스 후보 없음; 신규 후보 분석/주문 생략"
 
@@ -2521,6 +2665,7 @@ async def run_auto_trading(args: argparse.Namespace, *, execute: bool) -> dict[s
         "ok": selection_ok and all(row.get("ok", True) for row in analyses) and len(analyses) == len(tickers),
         "selectionReason": selection_reason,
         "marketGate": (candidate_snapshot.get("intradayScreen") or {}).get("marketGate"),
+        "skipped": "entry-window" if (candidate_snapshot.get("intradayScreen") or {}).get("status") == "time-blocked" else None,
         "scenario": scenario,
         "executionMode": "live" if execute else "dry-run",
         "date": args.date,
@@ -2577,9 +2722,10 @@ def require_resolved_live_orders():
 
 async def run_manual_job(base_args, control, job):
     # Freeze settings when queued; later web edits cannot mutate a running job.
-    args = argparse.Namespace(**deepcopy({key: value for key, value in vars(base_args).items() if key not in {"_controller", "_position_manager", "_telegram"}}))
+    args = argparse.Namespace(**deepcopy({key: value for key, value in vars(base_args).items() if key not in {"_controller", "_position_manager", "_telegram", "_weekly", "_strategy"}}))
     args._telegram = getattr(base_args, "_telegram", None)
     args._position_manager = getattr(base_args, "_position_manager", None)
+    args._strategy = getattr(base_args, "_strategy", None)
     for key, value in job["settings"].items():
         setattr(args, key, value)
     args.date = today_korea().isoformat()
@@ -2603,12 +2749,15 @@ async def run_manual_job(base_args, control, job):
                 args._intraday_fast = uses_intraday_rules(args)
                 result = await run_korea_toss(args, execute=control.live)
             else:
-                if not is_regular_market_open(datetime.now(KOREA_TZ), open_text=args.market_open,
-                                              close_text=args.market_close, holidays=holiday_dates(args.holiday_dates)):
-                    raise ValueError("대기 중 정규장이 종료되어 매매를 실행하지 않았습니다.")
+                gate = await asyncio.to_thread(manual_entry_gate, default_settings(args), getattr(args, "_position_manager", None))
+                if not gate["allowed"]:
+                    status = "skipped"
+                    result = {"ok": True, "skipped": "entry-window", "selectionReason": gate["notice"], "entryWindow": gate}
+                    return
                 if control.live:
                     require_resolved_live_orders()
-                slot = active_trading_slot(datetime.now(KOREA_TZ), args)
+                window = (datetime.fromisoformat(gate["startsAt"]), datetime.fromisoformat(gate["cutoffAt"]))
+                slot = active_trading_slot(datetime.now(KOREA_TZ), args, window)
                 args._schedule_slot = slot
                 if not has_scheduler_completed(args.date, args.scenario, slot):
                     mark_run_started(args.date, args.scenario, slot)
@@ -2617,6 +2766,8 @@ async def run_manual_job(base_args, control, job):
             checkpoint("finished")
             if isinstance(result, dict) and result.get("ok") is False:
                 status = "completed-with-errors"
+            elif isinstance(result, dict) and result.get("skipped") == "entry-window":
+                status = "skipped"
     except RunStopped as exc:
         status, result = "stopped", {"ok": False, "error": str(exc)}
     except Exception as exc:
@@ -2627,6 +2778,8 @@ async def run_manual_job(base_args, control, job):
             notify(args, "errors", "수동 작업 종료 · 확인 필요", [f"작업 {job['action']} · {status}", "상세 원인은 대시보드에서 확인하세요."], key="manual:" + job["id"])
         elif job["action"] == "analyze" and isinstance(result, dict):
             analysis_notification(args, {"analyses": [result], "ok": True})
+        elif status == "skipped" and not reserved_slot:
+            notify(args, "analysis", "수동 작업 생략 · 매수 시간 제한", [result["selectionReason"]], key="manual-skip:" + job["id"])
         if reserved_slot:
             mark_scheduler_completed(args.date, (result or {}).get("summaryPath"), status,
                                      scenario=args.scenario, slot=reserved_slot)
@@ -2680,6 +2833,13 @@ async def run_due_postmarket_review(args, now):
             return
         result = await asyncio.to_thread(postmarket.run_review, LOCAL_DIR, mode, now.date(), risk.store.path,
                                          now=now, market=market, backend=risk.backend)
+        comparison = getattr(args, "_strategy", None)
+        if comparison:
+            try:
+                if not comparison.snapshot()["active"]:
+                    comparison.submit()
+            except Exception:
+                pass  # Research failure must not invalidate a saved trading review.
         notify(args, "review", "장 마감 복기", [f"거래일 {result.get('date')} · {result.get('status')}",
                f"완료 거래 {result.get('roundTrips')}건 · 순실현손익 {result.get('netRealizedPnl')}원"],
                key=f"review:{now.date()}:{result.get('status')}")
@@ -2726,6 +2886,12 @@ async def run_daily_market_scheduler(args: argparse.Namespace) -> int:
         # Read-only review is independent of the manual trading pause switch.
         apply_trading_settings(args)
         await run_due_postmarket_review(args, datetime.now(KOREA_TZ))
+        weekly = getattr(args, "_weekly", None)
+        if weekly:
+            weekly.tick(datetime.now(KOREA_TZ))
+        comparison = getattr(args, "_strategy", None)
+        if comparison:
+            comparison.tick(datetime.now(KOREA_TZ))
         control = getattr(args, "_controller", None)
         if control:
             job = control.start()
@@ -2818,7 +2984,8 @@ async def run_daily_market_scheduler(args: argparse.Namespace) -> int:
                 summary["summaryPath"] = str(error_path)
             # Record partial failure separately and avoid replaying successful
             # orders automatically within a slot. The next slot is independent.
-            outcome = "stopped" if summary.get("stopped") else "completed" if summary.get("ok", True) else "completed-with-errors"
+            outcome = ("stopped" if summary.get("stopped") else "completed-with-errors" if not summary.get("ok", True)
+                       else "skipped" if summary.get("skipped") == "entry-window" else "completed")
             if control:
                 control.finish(outcome, summary)
             mark_scheduler_completed(run_date, summary.get("summaryPath"), outcome, scenario=scenario, slot=slot)
@@ -2876,10 +3043,11 @@ async def main_async() -> int:
     }
     if "no_openai_credit_fallback" in args._explicit_settings:
         args._explicit_settings.add("openai_credit_fallback")
-    for key in {**postmarket.DEFAULTS, **TELEGRAM_DEFAULTS}:
+    for key in {**postmarket.DEFAULTS, **weekly_review.DEFAULTS, **strategy_comparison.DEFAULTS, **TELEGRAM_DEFAULTS}:
         if "no_" + key in args._explicit_settings:
             args._explicit_settings.add(key)
     with scheduler_process_lock(args):
+        recover_premature_paper_slots(args)
         return await _main_async(args)
 
 
@@ -2908,6 +3076,15 @@ async def _main_async(args: argparse.Namespace) -> int:
         telegram = TelegramNotifier(LOCAL_DIR, "live" if args.scenario in {"auto-live", "korea-execute"} else "dry-run",
             lambda: {**default_settings(args), **load_trading_settings()}, risk_path=risk.store.path if risk else None)
         args._telegram = telegram
+    weekly = None
+    comparison = None
+    if risk and args.scenario in AUTO_SCENARIOS:
+        weekly = weekly_review.WeeklyReviewService(LOCAL_DIR, "live" if risk.live else "dry-run", risk.store.path,
+            risk.backend, lambda: {**default_settings(args), **load_trading_settings()}, telegram)
+        args._weekly = weekly
+        comparison = strategy_comparison.StrategyComparisonService(LOCAL_DIR, "live" if risk.live else "dry-run",
+            risk.store.path.stem, risk.backend, lambda: default_settings(args))
+        args._strategy = comparison
     if args.monitor:
         control = None
         if args.scenario in AUTO_SCENARIOS and args.run_mode == "daily-market":
@@ -2920,7 +3097,9 @@ async def _main_async(args: argparse.Namespace) -> int:
                         return "cancel"
                     return "wait" if state["active"] or state["pending"] else "ready"
                 risk.entry_watch.guard = watch_guard
-        monitor_server = start_monitor_server(args.monitor_host, args.monitor_port, scenario=args.scenario, control=control, risk=risk, telegram=telegram)
+                if comparison:
+                    comparison.guard = lambda: watch_guard() == "ready"
+        monitor_server = start_monitor_server(args.monitor_host, args.monitor_port, scenario=args.scenario, control=control, risk=risk, telegram=telegram, weekly=weekly, strategy=comparison)
         monitor_url = getattr(monitor_server, "monitor_url", f"http://{args.monitor_host}:{args.monitor_port}")
         monitor_token = ensure_monitor_token()
         print(
@@ -2955,6 +3134,10 @@ async def _main_async(args: argparse.Namespace) -> int:
         notify(args, "errors", "프로그램 중단", [type(exc).__name__, "대시보드와 터미널 상태를 확인하세요."])
         raise
     finally:
+        if comparison:
+            await asyncio.to_thread(comparison.close)
+        if weekly:
+            await asyncio.to_thread(weekly.close)
         if risk:
             await asyncio.to_thread(risk.stop)
         if monitor_server:

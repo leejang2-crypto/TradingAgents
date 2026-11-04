@@ -4,7 +4,7 @@
   const storageKey = 'tradingagents-dashboard-layout-v1';
   let saved = {};
   try { saved = JSON.parse(sessionStorage.getItem(storageKey) || '{}') || {}; } catch (_) {}
-  const views = ['overview', 'analysis', 'research', 'history', 'execution', 'settings'];
+  const views = ['overview', 'analysis', 'research', 'weekly', 'strategy', 'history', 'execution', 'settings'];
   let current = views.includes(saved.view) ? saved.view : 'overview';
   const scrolls = saved.scrolls && typeof saved.scrolls === 'object' ? saved.scrolls : {};
   const folds = saved.folds && typeof saved.folds === 'object' ? saved.folds : {};
@@ -61,6 +61,8 @@
   move('[data-live="analyses"]', 'analysis');
   move('[data-live="candidates"]', 'analysis');
   move('#research-panel', 'research');
+  move('#weekly-panel', 'weekly');
+  move('#strategy-panel', 'strategy');
   move('#account-panel', 'history');
   const orders = document.createElement('section');
   orders.append(el('position-order-panel')); el('view-history').append(orders);

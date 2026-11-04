@@ -28,6 +28,27 @@ def buy_window(window, settings, *, regular_open=None):
     return start, end
 
 
+def entry_window_state(now, window):
+    """A normal time veto, distinct from unavailable or malformed market data."""
+    result = {"allowed": False, "reason": "closed", "notice": "오늘은 신규 매수 가능 시간이 아닙니다.",
+              "startsAt": None, "cutoffAt": None}
+    if not window:
+        return result
+    start, cutoff = window
+    if start.date() != now.date() or cutoff.date() != now.date():
+        raise ValueError("매수 가능 시간의 거래일이 일치하지 않습니다.")
+    result.update(startsAt=start.isoformat(), cutoffAt=cutoff.isoformat())
+    if start >= cutoff:
+        return result
+    if now < start:
+        result.update(reason="before-entry", notice=f"신규 매수는 {start:%H:%M}부터 가능합니다. 매수 종료 {cutoff:%H:%M} 전까지 실행하세요.")
+    elif now >= cutoff:
+        result.update(reason="after-entry", notice=f"오늘 신규 매수는 {cutoff:%H:%M}에 종료되었습니다. 보유 종목 점검·청산은 별도로 계속됩니다.")
+    else:
+        result.update(allowed=True, reason="open", notice=None)
+    return result
+
+
 def scan_start(now, first, settings):
     interval = timedelta(minutes=int(settings.get("candidate_scan_minutes", TIME_DEFAULTS["candidate_scan_minutes"])))
     return first + max(0, (now - first) // interval) * interval

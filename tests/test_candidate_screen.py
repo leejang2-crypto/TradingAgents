@@ -121,7 +121,11 @@ def test_outside_session_or_insufficient_market_data_blocks_all(data, reason):
     if reason == 'closed': market.now = market.now.replace(hour=15, minute=1)
     if reason == 'too-early': market.now = market.now.replace(minute=10)
     result = screen(data, market)
-    assert result['status'] == 'failed' and not result['eligibleCount']
+    assert result['status'] == ('failed' if reason == 'historical' else 'time-blocked')
+    assert not result['eligibleCount']
+    if reason != 'historical':
+        assert result['error'] is None and result['notice']
+        assert not any(name == 'get_candles' for name, _ in market.calls)
 
 
 def index_close(market, price):
@@ -299,7 +303,8 @@ def test_user_hours_and_holidays_are_respected(data, settings):
     market = Market(data)
     result = screen_candidates(candidates(), market, settings,
         requested_date=data[4].date().isoformat(), clock=lambda: market.now)
-    assert result['status'] == 'failed' and not result['eligibleCount']
+    assert result['status'] == 'time-blocked' and not result['eligibleCount']
+    assert result['error'] is None
     assert not any(name == 'get_candles' for name, _ in market.calls)
 
 

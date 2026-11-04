@@ -320,6 +320,10 @@ def analysis_notification(args, summary):
 
 
 def _analysis_notification(args, summary):
+    if summary.get("skipped") == "entry-window":
+        notify(args, "analysis", "분석·신규 매수 생략 · 시간 제한", [summary.get("selectionReason") or "신규 매수 가능 시간 밖"],
+               key="analysis-skip:" + str(summary.get("summaryPath") or uuid.uuid4().hex))
+        return
     lines = ["분석 판정은 체결 내역이 아닙니다. 주문·체결 알림을 별도로 확인하세요."]
     for row in summary.get("analyses", [])[:8]:
         contract = row.get("intradayContract") or {}

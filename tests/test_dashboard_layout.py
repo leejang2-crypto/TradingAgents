@@ -52,7 +52,7 @@ def test_auto_run_button_starts_disabled_and_uses_existing_trade_action():
 def test_tabs_details_and_new_assets_are_declared():
     parsed = Elements(main.render_monitor_html({}))
     tabs = [attrs for _, attrs in parsed.tags if attrs.get('role') == 'tab']
-    assert [tab['data-view'] for tab in tabs] == ['overview', 'analysis', 'research', 'history', 'execution', 'settings']
+    assert [tab['data-view'] for tab in tabs] == ['overview', 'analysis', 'research', 'weekly', 'strategy', 'history', 'execution', 'settings']
     assert all(tab['aria-controls'] == 'view-' + tab['data-view'] for tab in tabs)
     groups = [attrs for tag, attrs in parsed.tags if tag == 'details' and attrs.get('class') == 'settings-group']
     assert len(groups) == 6

@@ -7,7 +7,7 @@
     'candidate-screen': '단타 후보 평가', 'candidate-screened': '단타 후보 선정 완료',
     planning: '주문 계획', 'order-preparation': '주문 준비', 'order-submitting': '주문 준비',
     'order-sending': '주문 접수 요청', 'paper-fill': '가상 체결', 'paper-record': '모의 기록'};
-  const statuses = {completed: '완료', stopped: '중단', failed: '실패', cancelled: '취소', interrupted: '재시작 전 중단', 'completed-with-errors': '일부 오류'};
+  const statuses = {completed: '완료', skipped: '시간 제한으로 생략', stopped: '중단', failed: '실패', cancelled: '취소', interrupted: '재시작 전 중단', 'completed-with-errors': '일부 오류'};
   let state = null, command = null, sending = false;
   const headers = {'Content-Type': 'application/json', 'X-Requested-With': 'TradingAgents'};
   // getRandomValues works on Tailscale HTTP too; randomUUID requires a secure context.
@@ -84,7 +84,7 @@
       }
       if (!response.ok) throw new Error(result.error || '실행 요청 실패');
       render(result.control);
-      message('실행 요청을 접수했습니다.');
+      message(result.skipped ? result.notice : '실행 요청을 접수했습니다.');
       command = null;
     } catch (error) { message(error.message); }
     finally { sending = false; if (state) render(state); }

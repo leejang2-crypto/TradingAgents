@@ -427,6 +427,17 @@ def test_partial_analysis_uses_error_category_and_bad_format_is_nonfatal(service
     assert notifier.error == '분석 알림 생성 실패'
 
 
+def test_entry_window_skip_is_not_an_error_notification(service):
+    notifier, _, _, _ = service
+    tg.analysis_notification(SimpleNamespace(_telegram=notifier), {
+        'ok': True, 'skipped': 'entry-window', 'selectionReason': '신규 매수는 10:00부터 가능합니다.',
+    })
+    sent = rows(notifier)
+    assert len(sent) == 1 and sent[0]['category'] == 'analysis'
+    assert '시간 제한' in sent[0]['text'] and '10:00' in sent[0]['text']
+    assert '일부 오류' not in sent[0]['text']
+
+
 def test_background_worker_drains_shutdown_queue(tmp_path):
     sent = []
     notifier = tg.TelegramNotifier(tmp_path, 'dry-run', lambda: {}, environ=ENV, sender=sent.append)

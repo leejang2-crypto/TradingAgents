@@ -77,6 +77,9 @@ class PaperAccount:
                 CREATE TABLE IF NOT EXISTS valuations (
                     id INTEGER PRIMARY KEY, recorded_at TEXT NOT NULL, payload TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS cost_profiles (
+                    revision INTEGER PRIMARY KEY, effective_at TEXT NOT NULL, payload TEXT NOT NULL
+                );
             """)
         self.path.chmod(0o600)
 
@@ -107,6 +110,40 @@ class PaperAccount:
     def symbols(self):
         with self.connect() as db:
             return [r["symbol"] for r in db.execute("SELECT * FROM positions") if number(r["quantity"]) > 0]
+
+    def cost_profile(self):
+        with self.connect() as db:
+            return self._cost_profile(db)
+
+    @staticmethod
+    def _cost_profile(db):
+        row = db.execute("SELECT payload FROM cost_profiles ORDER BY revision DESC LIMIT 1").fetchone()
+        if row:
+            return json.loads(row[0])
+        account = db.execute("SELECT fee_rate,tax_rate,slippage FROM account WHERE id=1").fetchone()
+        return {"revision": 0, "rates": dict(zip(("feeRate", "sellTaxRate", "slippageRate"), account)) if account else None}
+
+    def change_costs(self, rates, expected_revision, *, now=None):
+        """Prospective only. Caller must also lock/check pending strategy orders."""
+        values = [number(rates[k]) for k in ("feeRate", "sellTaxRate", "slippageRate")]
+        if any(not 0 <= v <= Decimal(".05") for v in values) or values[0] * 2 + values[1] + values[2] * 2 > Decimal(".05"):
+            raise ValueError("모의 비용 비율이 허용 범위를 벗어났습니다.")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = self._cost_profile(db)
+            if type(expected_revision) is not int or current["revision"] != expected_revision or current["rates"] is None:
+                raise ValueError("모의 비용 버전을 새로고침하세요.")
+            if any(number(r[0]) > 0 for r in db.execute("SELECT quantity FROM positions")):
+                raise ValueError("보유 종목 청산 후 비용을 변경하세요.")
+            now = now or now_kst()
+            if current["revision"] == 0:
+                db.execute("INSERT INTO cost_profiles VALUES(0,?,?)", (now.isoformat(), json.dumps(current)))
+            value = {"revision": current["revision"] + 1, "effectiveAt": now.isoformat(),
+                     "rates": dict(zip(("feeRate", "sellTaxRate", "slippageRate"), map(str, values)))}
+            db.execute("INSERT INTO cost_profiles VALUES(?,?,?)", (value["revision"], now.isoformat(), json.dumps(value)))
+            db.execute("UPDATE account SET fee_rate=?,tax_rate=?,slippage=? WHERE id=1", tuple(map(str, values)))
+            self._snapshot(db, now)
+        return value
 
     def trading_context(self, symbol, now=None):
         with self.connect() as db:
@@ -220,6 +257,7 @@ class PaperAccount:
                 raise ValueError("Paper account is not initialized")
             result = {"id": execution_id, "recordedAt": now.isoformat(), "symbol": plan.symbol,
                 "side": plan.action, "status": "SIMULATED_REJECTED", "simulated": True, "fillVerified": False}
+            result["costProfile"] = self._cost_profile(db)
             try:
                 if plan.action not in {"BUY", "SELL"} or not re.fullmatch(r"[A-Z0-9]{6}", plan.symbol):
                     raise ValueError("Paper fills support Korean BUY/SELL orders only")

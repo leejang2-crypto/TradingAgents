@@ -63,6 +63,15 @@ details > summary { cursor: pointer; padding: 8px 0; font-size: 14px; overflow-w
 .research-evidence { max-height: 320px; overflow: auto; }
 .research-quarter-table { font-size: 12px; min-width: 680px; }
 #research-limitations { font-size: 13px; color: #526174; padding-left: 20px; }
+#weekly-panel p, #weekly-panel li { overflow-wrap: anywhere; line-height: 1.6; }
+#weekly-panel h3 { font-size: 16px; margin-top: 18px; }
+#weekly-panel table { min-width: 480px; }
+#weekly-panel details { border-top: 1px solid #d9dee7; padding: 8px 0; }
+#strategy-panel p, #strategy-panel li { overflow-wrap: anywhere; line-height: 1.6; }
+#strategy-panel table { min-width: 560px; }
+#strategy-panel details { border-top: 1px solid #d9dee7; padding: 8px 0; }
+#strategy-panel h3 { font-size: 16px; }
+#weekly-status { min-height: 24px; }
 #account-preview button { margin-top: 12px; }
 .table-tools { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; margin: 12px 0; }
 .table-tools > label { flex: 0 1 160px; min-width: 0; font-size: 12px; }
@@ -79,8 +88,8 @@ details > summary { cursor: pointer; padding: 8px 0; font-size: 14px; overflow-w
   #view-overview .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
   #view-overview .metric { min-width: 0; padding: 8px; }
   #view-overview .value { font-size: 14px; overflow-wrap: anywhere; }
-  #dashboard-tabs { position: fixed; top: auto; bottom: 0; left: 0; right: 0; padding: 0 8px env(safe-area-inset-bottom); display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); border-top: 1px solid #c9d0dc; border-bottom: 0; }
-  #dashboard-tabs button { padding: 14px 0; min-height: 56px; font-size: 12px; border-bottom: 0; border-top: 3px solid transparent; }
+  #dashboard-tabs { position: fixed; top: auto; bottom: 0; left: 0; right: 0; padding: 0 8px env(safe-area-inset-bottom); display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); border-top: 1px solid #c9d0dc; border-bottom: 0; }
+  #dashboard-tabs button { padding: 8px 1px; min-height: 56px; height: 56px; font-size: 12px; line-height: 16px; white-space: normal; word-break: keep-all; border-bottom: 0; border-top: 3px solid transparent; }
   #dashboard-tabs button[aria-selected="true"] { border-top-color: #147669; }
   .dashboard-ready #dashboard-main { padding-bottom: calc(78px + env(safe-area-inset-bottom)); }
   .settings-savebar { bottom: calc(56px + env(safe-area-inset-bottom)); }
